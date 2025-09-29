@@ -1,0 +1,21 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String   @id @default(cuid())
+  phone      String   @unique
+  // --- yeni alanlar ---
+  dominantFoot String  @default("N") // L | R | N (None)
+  positions Json   // default yok; backend [] yazar
+  level        Int      @default(5)  // 1..10
+  // --- timestamps ---
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
