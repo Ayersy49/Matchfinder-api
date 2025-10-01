@@ -1,3 +1,4 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -7,15 +8,55 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id         String   @id @default(cuid())
-  phone      String   @unique
-  // --- yeni alanlar ---
-  dominantFoot String  @default("N") // L | R | N (None)
-  positions Json   // default yok; backend [] yazar
-  level        Int      @default(5)  // 1..10
-  // --- timestamps ---
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+enum DominantFoot {
+  L
+  R
+  B
+  N
 }
 
+model User {
+  id                 String       @id @default(cuid())
+  phone              String       @unique
+  dominantFoot       DominantFoot @default(N)
+  positions          Json
+  positionLevels     Json?
+  availability       Json?
+  preferredFormation String? // "4-2-3-1" | "4-3-3" | "3-5-2"
+  level              Int          @default(5)
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  // İstersen ilişki geri tarafı:
+  // messages          Message[]    // gerekmez ama ekleyebilirsin
+  Message Message[]
+  Match   Match[]
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  matchId   String
+  userId    String
+  text      String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([matchId, createdAt])
+}
+
+model Match {
+  id       String   @id @default(cuid())
+  title    String
+  location String? // "Beşiktaş Halısaha" gibi
+  level    String   @default("Orta") // "Kolay" | "Orta" | "Zor"
+  format   String   @default("7v7") // "5v5" | "7v7" | "8v8" | "11v11"
+  price    Int? // ₺ cinsinden
+  time     DateTime @default(now()) // maç saati (şimdilik)
+  slots    Json     @default("[]") // [{pos:"GK", userId:null}, ...] basit JSON
+  ownerId  String?
+  owner    User?    @relation(fields: [ownerId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

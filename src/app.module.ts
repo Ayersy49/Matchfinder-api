@@ -3,16 +3,18 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { RedisModule } from '@nestjs-modules/ioredis';
-
+import { MatchesModule } from './matches/matches.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
+import { MessagesModule } from './messages/messages.module';
 
 @Module({
   imports: [
+    MessagesModule,
     // .env'i global yükle
     ConfigModule.forRoot({ isGlobal: true }),
-
+    
     // JWT ayarları (global)
     JwtModule.registerAsync({
       global: true,
@@ -22,7 +24,7 @@ import { AuthModule } from './auth/auth.module';
         signOptions: { expiresIn: '12h' },
       }),
     }),
-
+  
     // Redis bağlantısı (ioredis)
     RedisModule.forRootAsync({
       inject: [ConfigService],
@@ -42,6 +44,7 @@ import { AuthModule } from './auth/auth.module';
     PrismaModule,
     UsersModule,
     AuthModule,
+    MatchesModule,
   ],
 })
 export class AppModule {}
