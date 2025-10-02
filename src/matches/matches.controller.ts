@@ -3,164 +3,229 @@ import {
   Body,
   Controller,
   Get,
-  Param,
   Post,
+  Query,
+  Param,
   Req,
   UseGuards,
+  HttpException,
+  HttpStatus,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+  UnauthorizedException,   // <-- eklendi
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { Prisma } from '@prisma/client';          // <-- JSON alanına tipli cast için
 import { AuthGuard } from '@nestjs/passport';
+
+/** Varsayılan slot listeleri (format -> pozisyon dizisi) */
+const DEFAULT_SLOTS: Record<string, string[]> = {
+  '5v5': ['GK', 'CB', 'CM', 'LW', 'ST'],
+  '7v7': ['GK', 'LB', 'CB', 'RB', 'CM', 'LW', 'ST'],
+  '8v8': ['GK', 'LB', 'CB', 'RB', 'CM', 'AM', 'LW', 'ST'],
+  '11v11': ['GK', 'LB', 'CB', 'RB', 'LWB', 'RWB', 'DM', 'CM', 'AM', 'LW', 'ST'],
+};
 
 type Slot = { pos: string; userId?: string | null };
 
-type CreateDto = {
-  title: string;
-  location?: string;
-  level?: 'Kolay' | 'Orta' | 'Zor';
-  format?: '5v5' | '7v7' | '8v8' | '11v11';
-  price?: number;
-  time?: string; // ISO
-  slots?: Slot[];
-};
-
-type JoinDto = { matchId: string; pos: string };
-type LeaveDto = { matchId: string };
-
-function safeSlots(raw: any): Slot[] {
-  if (!raw) return [];
-  try {
-    const v = Array.isArray(raw) ? raw : JSON.parse(String(raw));
-    return (v as any[]).map((s) => ({
-      pos: String(s?.pos ?? '').toUpperCase().slice(0, 8),
-      userId: s?.userId ?? null,
-    }));
-  } catch {
-    return [];
-  }
+function getUserIdFromReq(req: any): string | undefined {
+  return req?.user?.id || req?.user?.sub || req?.user?.userId || undefined;
 }
-
-// Kullanıcı oluşmadıysa telefonla upsert et (UsersController.me ile uyumlu)
-const DEFAULT_AVAILABILITY = {
-  mon: { enabled: false, start: '20:00', end: '23:59' },
-  tue: { enabled: false, start: '20:00', end: '23:59' },
-  wed: { enabled: false, start: '20:00', end: '23:59' },
-  thu: { enabled: false, start: '20:00', end: '23:59' },
-  fri: { enabled: false, start: '20:00', end: '23:59' },
-  sat: { enabled: false, start: '20:00', end: '23:59' },
-  sun: { enabled: false, start: '20:00', end: '23:59' },
-};
-
-async function ensureUserId(prisma: PrismaService, req: any): Promise<string | undefined> {
-  let userId = req.user?.sub as string | undefined;
-  if (userId) return userId;
-
-  const phoneDigits = String(req.user?.phone ?? '').replace(/\D/g, '');
-  if (!phoneDigits) return undefined;
-
-  const u = await prisma.user.upsert({
-    where: { phone: phoneDigits },
-    update: {},
-    create: {
-      phone: phoneDigits,
-      positions: [],
-      positionLevels: {},
-      availability: DEFAULT_AVAILABILITY,
-    },
-  });
-  return u.id;
+function makeDefaultSlots(format?: string): Slot[] {
+  const fmt = (format || '7v7').toLowerCase();
+  const base = DEFAULT_SLOTS[fmt] ?? DEFAULT_SLOTS['7v7'];
+  return base.map((pos) => ({ pos, userId: null }));
+}
+function normalizeSlots(raw: any, format?: string): Slot[] {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((x) => {
+        if (!x) return null;
+        const pos = String((x as any).pos ?? '').toUpperCase();
+        const userId = (x as any).userId ?? null;
+        return pos ? ({ pos, userId } as Slot) : null;
+      })
+      .filter(Boolean) as Slot[];
+  }
+  return makeDefaultSlots(format);
+}
+function pickPreferredOpenPos(slots: Slot[], prefs?: string[] | null) {
+  const open = (slots || []).filter((s) => !s.userId).map((s) => s.pos);
+  if (!open.length) return null;
+  for (const p of prefs || []) if (open.includes(p)) return p;
+  return open[0];
 }
 
 @Controller('matches')
-@UseGuards(AuthGuard('jwt'))
 export class MatchesController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private prisma: PrismaService) {}
 
-  // Liste
+  /* Liste */
   @Get()
-  async list() {
-    return this.prisma.match.findMany({
-      orderBy: { time: 'desc' },
-      take: 50,
-      include: { owner: true },
+  async list(@Query() q: any) {
+    const items = await this.prisma.match.findMany({
+      orderBy: [{ time: 'asc' as const }, { createdAt: 'desc' as const }],
+      select: {
+        id: true, title: true, location: true, level: true, format: true,
+        price: true, time: true, createdAt: true, slots: true, ownerId: true,
+      },
     });
+    return items.map((m: any) => ({ ...m, slots: normalizeSlots(m.slots, m.format) }));
   }
 
-  // Detay
+  /* Detay */
   @Get(':id')
   async detail(@Param('id') id: string) {
-    return this.prisma.match.findUnique({
+    const m: any = await this.prisma.match.findUnique({
       where: { id },
-      include: { owner: true },
+      select: {
+        id: true, title: true, location: true, level: true, format: true,
+        price: true, time: true, createdAt: true, updatedAt: true,
+        ownerId: true, slots: true,
+      },
     });
+    if (!m) throw new NotFoundException('match not found');
+    return { ...m, slots: normalizeSlots(m.slots, m.format) };
   }
 
-  // Oluştur
+  /* Oluştur */
   @Post()
-  async create(@Req() req: any, @Body() dto: CreateDto) {
-    const ownerId = await ensureUserId(this.prisma, req);
+  @UseGuards(AuthGuard('jwt'))
+  async create(@Req() req: any, @Body() body: any) {
+    const userId = getUserIdFromReq(req);
+    if (!userId) throw new HttpException('unauthorized', HttpStatus.UNAUTHORIZED);
 
-    const payload = {
-      title: (dto.title ?? '').trim().slice(0, 100) || 'Maç',
-      location: (dto.location ?? '').trim().slice(0, 100) || null,
-      level: (dto.level ?? 'Orta') as string,
-      format: (dto.format ?? '7v7') as string,
-      price:
-        typeof dto.price === 'number' ? Math.max(0, Math.floor(dto.price)) : null,
-      time: dto.time ? new Date(dto.time) : new Date(),
-      slots: dto.slots && Array.isArray(dto.slots) ? safeSlots(dto.slots) : [],
-      ownerId: ownerId ?? null,
+    const data = {
+      title: body?.title ?? null,
+      location: body?.location ?? null,
+      level: body?.level ?? null,
+      format: (body?.format ?? '7v7') as string,
+      price: typeof body?.price === 'number' ? body.price : null,
+      time: body?.time ?? null,
+      slots:
+        Array.isArray(body?.slots) && body.slots.length
+          ? (normalizeSlots(body.slots, body?.format) as unknown as Prisma.JsonArray)
+          : (makeDefaultSlots(body?.format) as unknown as Prisma.JsonArray),
+      ownerId: userId,
     };
 
-    const created = await this.prisma.match.create({ data: payload });
-    return created;
+    const created: any = await this.prisma.match.create({ data });
+    return { ...created, slots: normalizeSlots(created.slots, created.format) };
   }
 
-  // Katıl
+  /* Katıl (quick veya buton tıklama)  */
+  // body: { matchId: string; pos?: string; strict?: boolean }
   @Post('join')
-  async join(@Req() req: any, @Body() body: JoinDto) {
-    const userId = await ensureUserId(this.prisma, req);
-    if (!userId) return { ok: false, reason: 'no_user' };
+  @UseGuards(AuthGuard('jwt'))
+  async join(@Req() req: any, @Body() body: { matchId: string; pos?: string; strict?: boolean }) {
+    const user = req.user;
+    if (!user?.id) throw new UnauthorizedException();
 
-    const m = await this.prisma.match.findUnique({ where: { id: body.matchId } });
-    if (!m) return { ok: false, reason: 'not_found' };
+    const match = await this.prisma.match.findUnique({ where: { id: body.matchId } });
+    if (!match) throw new NotFoundException('match not found');
 
-    const pos = String(body.pos || '').toUpperCase().slice(0, 8);
-    let slots = safeSlots(m.slots);
+    const slots: Slot[] = normalizeSlots((match as any).slots, (match as any).format);
 
-    // Kullanıcının eski slotunu boşalt (tek slot kuralı)
-    slots = slots.map((s) => (s.userId === userId ? { ...s, userId: null } : s));
+    // zaten slottaysan aynısını döndür
+    const mine = slots.find((s) => s.userId === user.id);
+    if (mine) return { ok: true, pos: mine.pos };
 
-    // İstenen pozisyon dolu değilse doldur, yoksa yeni slot ekle
-    const free = slots.find((s) => s.pos === pos && !s.userId);
-    if (free) free.userId = userId;
-    else slots.push({ pos, userId });
+    let desired = body.pos?.trim().toUpperCase();
 
-    const updated = await this.prisma.match.update({
-      where: { id: m.id },
-      data: { slots },
+    if (!desired) {
+      const me = await this.prisma.user.findUnique({ where: { id: user.id }, select: { positions: true } });
+      const prefs: string[] = Array.isArray(me?.positions) ? me!.positions.map(String) : [];
+      const open = slots.filter((s) => !s.userId).map((s) => s.pos);
+
+      if (prefs.length) desired = prefs.find((p) => open.includes(p));
+      if (!desired && body.strict) throw new ConflictException('no preferred open slot');
+      if (!desired) desired = open[0];
+    }
+    if (!desired) throw new ConflictException('no empty slot');
+
+    // transaction
+    await this.prisma.$transaction(async (tx) => {
+      const fresh = await tx.match.findUnique({ where: { id: match.id } });
+      const arr: Slot[] = normalizeSlots((fresh as any)?.slots, (fresh as any)?.format);
+
+      const i = arr.findIndex((s) => s.pos === desired);
+      if (i === -1) throw new BadRequestException('invalid pos (fresh)');
+      if (arr[i].userId && arr[i].userId !== user.id) throw new ConflictException('slot already taken');
+
+      // kullanıcının varsa önceki slotlarını temizle
+      for (const s of arr) if (s.userId === user.id) s.userId = null;
+
+      arr[i] = { ...arr[i], userId: user.id };
+
+      await tx.match.update({
+        where: { id: match.id },
+        data: { slots: arr as unknown as Prisma.JsonArray }, // <-- tipli cast
+        select: { id: true },
+      });
     });
 
-    return { ok: true, match: updated };
+    return { ok: true, pos: desired };
   }
 
-  // Ayrıl
+  /* Ayrıl */
   @Post('leave')
-  async leave(@Req() req: any, @Body() body: LeaveDto) {
-    const userId = await ensureUserId(this.prisma, req);
-    if (!userId) return { ok: false, reason: 'no_user' };
+  @UseGuards(AuthGuard('jwt'))
+  async leave(@Req() req: any, @Body() body: any) {
+    const userId = getUserIdFromReq(req);
+    if (!userId) throw new HttpException('unauthorized', HttpStatus.UNAUTHORIZED);
 
-    const m = await this.prisma.match.findUnique({ where: { id: body.matchId } });
-    if (!m) return { ok: false, reason: 'not_found' };
+    const matchId: string = body?.matchId;
+    if (!matchId) throw new BadRequestException('matchId required');
 
-    const slots = safeSlots(m.slots).map((s) =>
-      s.userId === userId ? { ...s, userId: null } : s,
-    );
+    const m: any = await this.prisma.match.findUnique({ where: { id: matchId }, select: { id: true, format: true, slots: true } });
+    if (!m) throw new NotFoundException('not_found');
 
-    const updated = await this.prisma.match.update({
-      where: { id: m.id },
-      data: { slots },
+    const slots = normalizeSlots(m.slots, m.format);
+    for (const s of slots) if (s.userId === userId) s.userId = null;
+
+    await this.prisma.match.update({
+      where: { id: matchId },
+      data: { slots: slots as unknown as Prisma.JsonArray }, // <-- tipli cast
     });
 
-    return { ok: true, match: updated };
+    return { ok: true };
+  }
+
+  /* Eski maçları sil */
+  @Post('delete-old')
+  @UseGuards(AuthGuard('jwt'))
+  async deleteOld() {
+    const now = new Date();
+    const nowISO = now.toISOString();
+
+    const res = await this.prisma.match.deleteMany({
+      where: {
+        OR: [
+          { AND: [{ time: { not: null } }, { time: { lt: nowISO } }] }, // time string ise ISO
+          { AND: [{ time: null as any }, { createdAt: { lt: new Date(now.getTime() - 1000 * 60 * 60 * 24 * 3) } }] },
+        ],
+      },
+    });
+    return { ok: true, deleted: res.count };
+  }
+
+  /* Eski maçlara default slot bas */
+  @Post('backfill-slots')
+  @UseGuards(AuthGuard('jwt'))
+  async backfill() {
+    const all = await this.prisma.match.findMany({ select: { id: true, format: true, slots: true } });
+    let updated = 0;
+    for (const m of all as any[]) {
+      const normalized = normalizeSlots(m.slots, m.format);
+      if (!Array.isArray(m.slots) || m.slots?.length === 0) {
+        await this.prisma.match.update({
+          where: { id: m.id },
+          data: { slots: normalized as unknown as Prisma.JsonArray }, // <-- tipli cast
+        });
+        updated++;
+      }
+    }
+    return { ok: true, updated };
   }
 }
