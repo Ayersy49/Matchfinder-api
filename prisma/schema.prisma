@@ -5,7 +5,7 @@ generator client {
 
 datasource db {
   provider = "sqlite"
-  url      = env("DATABASE_URL")
+  url      = env("DATABASE_URL") // .env: file:./prisma/dev.db
 }
 
 enum DominantFoot {
@@ -15,6 +15,13 @@ enum DominantFoot {
   N
 }
 
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+}
+
 model User {
   id                 String       @id @default(cuid())
   phone              String       @unique
@@ -22,25 +29,59 @@ model User {
   positions          Json
   positionLevels     Json?
   availability       Json?
-  preferredFormation String? // "4-2-3-1" | "4-3-3" | "3-5-2"
+  preferredFormation String?
   level              Int          @default(5)
   createdAt          DateTime     @default(now())
   updatedAt          DateTime     @updatedAt
+  invitesSent        Invite[]     @relation("InviteFromUser")
+  invitesReceived    Invite[]     @relation("InviteToUser")
 
-  // İstersen ilişki geri tarafı:
-  // messages          Message[]    // gerekmez ama ekleyebilirsin
-  Message Message[]
-  Match   Match[]
+  Message      Message[]
+  Match        Match[]
+  discoverable Boolean   @default(true)
+  lat          Float?
+  lng          Float?
+  city         String?
+  district     String?
+
+  @@index([lat, lng])
+}
+
+model Invite {
+  id String @id @default(cuid())
+
+  // relations
+  matchId String
+  match   Match  @relation("MatchInvites", fields: [matchId], references: [id], onDelete: Cascade)
+
+  fromId String
+  from   User   @relation("InviteFromUser", fields: [fromId], references: [id], onDelete: Cascade)
+
+  toId String
+  to   User   @relation("InviteToUser", fields: [toId], references: [id], onDelete: Cascade)
+
+  // data
+  status  InviteStatus @default(PENDING)
+  message String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([matchId])
+  @@index([fromId])
+  @@index([toId])
 }
 
 model Message {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   matchId   String
   userId    String
   text      String
-  createdAt DateTime @default(now())
-
-  user User @relation(fields: [userId], references: [id])
+  deleted   Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  editedAt  DateTime?
+  user      User      @relation(fields: [userId], references: [id])
 
   @@index([matchId, createdAt])
 }
@@ -48,15 +89,21 @@ model Message {
 model Match {
   id       String   @id @default(cuid())
   title    String
-  location String? // "Beşiktaş Halısaha" gibi
-  level    String   @default("Orta") // "Kolay" | "Orta" | "Zor"
-  format   String   @default("7v7") // "5v5" | "7v7" | "8v8" | "11v11"
-  price    Int? // ₺ cinsinden
-  time     DateTime @default(now()) // maç saati (şimdilik)
-  slots    Json     @default("[]") // [{pos:"GK", userId:null}, ...] basit JSON
-  ownerId  String?
-  owner    User?    @relation(fields: [ownerId], references: [id])
+  location String?
+  level    String   @default("Orta")
+  format   String   @default("7v7")
+  price    Int?
+  time     DateTime @default(now())
+  slots    Json     @default("[]")
+
+  ownerId String?
+  owner   User?   @relation(fields: [ownerId], references: [id])
+
+  // 👇 ilişki karşı ucu; isim aynı olmalı
+  invites Invite[] @relation("MatchInvites")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  lat       Float?
+  lng       Float?
 }
