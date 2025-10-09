@@ -17,3 +17,5 @@ coverage/
 .env.*
 .DS_Store
 .git/
+*.zip
+*.db
