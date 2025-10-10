@@ -19,7 +19,6 @@ import { AuthGuard } from '@nestjs/passport';
 import { Prisma, InviteStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
-// Takımlı slot yardımcıları
 import {
   buildInitialSlots,
   upgradeLegacySlots,
@@ -57,7 +56,7 @@ async function canAccessMatch(
   });
   if (!m) return { ok: false, code: 'not_found' };
   if (m.ownerId === userId) return { ok: true };
-  const slots = upgradeLegacySlots(m.slots, m.format);
+  const slots = normalizeSlots(m.slots, m.format);
   const isParticipant = slots.some((s) => s.userId === userId);
   return isParticipant ? { ok: true } : { ok: false, code: 'forbidden' };
 }
@@ -86,7 +85,7 @@ export class MatchesController {
     });
     return items.map((m) => ({
       ...m,
-      slots: upgradeLegacySlots(m.slots, m.format),
+      slots: normalizeSlots(m.slots, m.format),
     }));
   }
 
@@ -110,7 +109,7 @@ export class MatchesController {
       },
     });
     if (!m) throw new NotFoundException('match not found');
-    return { ...m, slots: upgradeLegacySlots(m.slots, m.format) };
+    return { ...m, slots: normalizeSlots(m.slots, m.format) };
   }
 
   /* -------------------- OLUŞTUR -------------------- */
@@ -120,7 +119,7 @@ export class MatchesController {
     const userId = getUserIdFromReq(req);
     if (!userId) throw new HttpException('unauthorized', HttpStatus.UNAUTHORIZED);
 
-    // kullanıcının varlığını doğrula (token orphan ise)
+    // kullanıcının varlığını doğrula
     const me = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
     if (!me) throw new UnauthorizedException('reauth_required');
 
@@ -162,7 +161,7 @@ export class MatchesController {
   @UseGuards(AuthGuard('jwt'))
   async join(
     @Req() req: any,
-    @Body() body: { matchId: string; pos?: string; strict?: boolean; team?: Team },
+    @Body() body: { matchId: string; pos?: string; team?: Team; strict?: boolean },
   ) {
     const user = req.user;
     if (!user?.id) throw new UnauthorizedException();
@@ -172,16 +171,23 @@ export class MatchesController {
 
     const slots: Slot[] = normalizeSlots((match as any).slots, (match as any).format);
 
-    // Zaten katıldıysa kısa yol
+    // Zaten katıldıysa
     const mine = slots.find((s) => s.userId === user.id);
-    if (mine) return { ok: true, pos: mine.pos, team: mine.team };
+    if (mine) return { ok: true, pos: mine.pos };
 
-    const preferredTeam: Team | undefined = body.team;
-
-    // 1) İstekle pozisyon geldiyse onu deneriz
+    // İstekle pozisyon geldiyse (ve takım geldiyse o takımda kontrol et)
     let desired = body.pos?.trim().toUpperCase();
+    if (desired) {
+      if (body.team) {
+        const ok = slots.some((s) => s.pos === desired && s.team === body.team && !s.userId);
+        if (!ok) throw new ConflictException('slot already taken');
+      } else {
+        const ok = slots.some((s) => s.pos === desired && !s.userId);
+        if (!ok) throw new ConflictException('slot already taken');
+      }
+    }
 
-    // 2) Gelmediyse: sadece tercihlerin uygunsa auto-join
+    // Gelmediyse: sadece tercihlerin uygunsa auto-join
     if (!desired) {
       const me = await this.prisma.user.findUnique({
         where: { id: user.id },
@@ -189,36 +195,32 @@ export class MatchesController {
       });
 
       const prefs: string[] = Array.isArray(me?.positions)
-        ? (me!.positions as any[]).map(String).slice(0, 3).map(p => p.toUpperCase())
+        ? (me!.positions as any[]).map(String).slice(0, 3).map((p) => p.toUpperCase())
         : [];
 
-      // Takım filtresiyle boş pozisyonları set’e topla
       const open = new Set(
-        slots
-          .filter(s => !s.userId && (!preferredTeam || s.team === preferredTeam))
-          .map(s => s.pos)
+        slots.filter((s) => !s.userId && (!body.team || s.team === body.team)).map((s) => s.pos),
       );
 
-      // tercihler içinde ilk uygun olanı seç
-      desired = prefs.find(p => open.has(p));
+      desired = prefs.find((p) => open.has(p));
 
-      // Tercihlerden hiçbiri boş değilse otomatik atama yapma -> 409
+      // Tercihlerinden hiçbiri boş değilse otomatik atama yapma
       if (!desired) {
-        throw new ConflictException('no preferred open slot'); // client detayda slot seçtirir
+        throw new ConflictException('no preferred open slot'); // 409 – client detayda seçtirir
       }
     }
 
-    // 3) Seçili pozisyonu (ve varsa takım’ı) atomik olarak doldur
+    // Atomik güncelle
     await this.prisma.$transaction(async (tx) => {
       const fresh = await tx.match.findUnique({ where: { id: match.id } });
       const arr: Slot[] = normalizeSlots((fresh as any)?.slots, (fresh as any)?.format);
 
       const i = arr.findIndex(
-        (s) => s.pos === desired && !s.userId && (!preferredTeam || s.team === preferredTeam),
+        (s) => s.pos === desired && !s.userId && (!body.team || s.team === body.team),
       );
       if (i === -1) throw new ConflictException('slot already taken');
 
-      // Kullanıcı başka yerdeyse temizle
+      // Eski yerinden temizle
       for (const s of arr) if (s.userId === user.id) s.userId = null;
 
       arr[i] = { ...arr[i], userId: user.id };
@@ -230,15 +232,7 @@ export class MatchesController {
       });
     });
 
-    return { ok: true, pos: desired, team: preferredTeam ?? 'auto' };
-  }
-
-  /* -------------------- AYRIL (WRAPPER: /matches/leave) -------------------- */
-  @Post('leave')
-  @UseGuards(AuthGuard('jwt'))
-  async leaveLegacy(@Req() req: any, @Body() body: { matchId: string }) {
-    if (!body?.matchId) throw new BadRequestException('matchId required');
-    return this.leaveRest(req, body.matchId);
+    return { ok: true, pos: desired };
   }
 
   /* -------------------- AYRIL (REST: /matches/:id/leave) -------------------- */
@@ -254,7 +248,7 @@ export class MatchesController {
     });
     if (!m) throw new NotFoundException('match not found');
 
-    const slots = upgradeLegacySlots(m.slots, m.format);
+    const slots = normalizeSlots(m.slots, m.format);
     const changed = removeUser(slots, userId);
     if (!changed) return { ok: true };
 
@@ -266,35 +260,27 @@ export class MatchesController {
     return { ok: true };
   }
 
-  /* -------------------- ESKİ MAÇ TEMİZLEME (daha sağlam) -------------------- */
+  /* -------------------- ESKİ MAÇ TEMİZLEME -------------------- */
   @Post('delete-old')
   @UseGuards(AuthGuard('jwt'))
   async deleteOld() {
-    // "zamanı geçmiş" eşik: şimdi
     const now = new Date();
-
-    // "zamanı belirsiz" (time null) olanlar için esik: 3 gün önce
     const threeDaysAgo = new Date(Date.now() - 1000 * 60 * 60 * 24 * 3);
 
-    // 1) time < now olanları sil
     const r1 = await this.prisma.match.deleteMany({
       where: { time: { lt: now } },
     });
 
-    // 2) time == null VE createdAt < threeDaysAgo olanları sil
     const r2 = await this.prisma.match.deleteMany({
       where: {
-        AND: [
-          { time: { equals: null } as any },  // tip atlatma
-          { createdAt: { lt: threeDaysAgo } },
-        ],
+        AND: [{ time: { equals: null } as any }, { createdAt: { lt: threeDaysAgo } }],
       },
     });
 
     return { ok: true, deleted: r1.count + r2.count, parts: { past: r1.count, stale: r2.count } };
   }
 
-  /* -------------------- ESKİ SLOT'U YÜKSELT (opsiyonel toplu) -------------------- */
+  /* -------------------- ESKİ SLOT’U YÜKSELT (opsiyonel toplu) -------------------- */
   @Post('upgrade-slots')
   @UseGuards(AuthGuard('jwt'))
   async upgradeAll() {
@@ -304,8 +290,7 @@ export class MatchesController {
     let updated = 0;
     for (const m of all) {
       const upgraded = upgradeLegacySlots(m.slots, m.format);
-      // zaten yeni ise atla (ilk elemanda team varsa yeni formattır)
-      if (Array.isArray(m.slots) && (m.slots as any[])[0]?.team) continue;
+      if (Array.isArray(m.slots) && (m.slots as any[])[0]?.team) continue; // zaten yeni
       await this.prisma.match.update({
         where: { id: m.id },
         data: { slots: upgraded as unknown as Prisma.JsonArray },
@@ -467,9 +452,7 @@ export class MatchesController {
     return { ok: true, message: updated };
   }
 
-  /* ===================== INVITES ===================== */
-
-  /** Maç için davetleri listele (owner + katılımcılar) */
+  /* ================== INVITES (listeleme/gönderme/yanıtlama) ================== */
   @UseGuards(AuthGuard('jwt'))
   @Get(':id/invites')
   async listInvites(@Req() req: any, @Param('id') matchId: string) {
@@ -492,15 +475,14 @@ export class MatchesController {
         message: true,
         createdAt: true,
         updatedAt: true,
-        from: { select: { id: true, phone: true } },
-        to: { select: { id: true, phone: true } },
+        from: { select: { id: true, phone: true} },
+        to: { select: { id: true, phone: true} },
       },
     });
 
     return { items: rows };
   }
 
-  /** Davet gönder (owner + katılımcılar) */
   @UseGuards(AuthGuard('jwt'))
   @Post(':id/invites')
   async createInvite(
@@ -543,7 +525,6 @@ export class MatchesController {
     if (!toUser) throw new BadRequestException('recipient not found');
     if (toUser.id === userId) throw new BadRequestException('cannot invite yourself');
 
-    // aynı maç + aynı alıcı için açık davet var mı?
     const existing = await this.prisma.invite.findFirst({
       where: {
         matchId,
@@ -575,7 +556,6 @@ export class MatchesController {
     return { ok: true, invite: created };
   }
 
-  /** Davete yanıt ver (ACCEPT/DECLINE alıcı; CANCEL gönderici) */
   @UseGuards(AuthGuard('jwt'))
   @Post('invites/:inviteId/respond')
   async respondInvite(
@@ -619,7 +599,7 @@ export class MatchesController {
     return { ok: true, invite: updated };
   }
 
-  /* ================== INBOX (bana gelen davetler) ================== */
+  /* ================== INBOX / OUTBOX ================== */
   @UseGuards(AuthGuard('jwt'))
   @Get('invites/inbox')
   async listMyIncomingInvites(@Req() req: any, @Query('status') status?: string) {
@@ -658,7 +638,6 @@ export class MatchesController {
     return { items: rows };
   }
 
-  /* ================== OUTBOX (benim gönderdiklerim) ================== */
   @UseGuards(AuthGuard('jwt'))
   @Get('invites/sent')
   async listMySentInvites(@Req() req: any, @Query('status') status?: string) {

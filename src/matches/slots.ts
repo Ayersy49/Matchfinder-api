@@ -1,9 +1,7 @@
 // src/matches/slots.ts
-
 export type Team = 'A' | 'B';
 export type Slot = { team: Team; pos: string; userId: string | null };
 
-/** Format stringinden (örn: 7v7) takım başına slot sayısı çıkarır. */
 export function teamSizeFromFormat(format?: string): number {
   const m = /(\d+)\s*v\s*(\d+)/i.exec(format || '');
   if (!m) return 7; // default 7v7
@@ -11,7 +9,6 @@ export function teamSizeFromFormat(format?: string): number {
   return Math.max(1, Math.min(left, 11));
 }
 
-/** Varsayılan pozisyon listeleri (takım başına) */
 export const DEFAULT_SLOTS: Record<string, string[]> = {
   '5v5':   ['GK', 'CB', 'CM', 'LW', 'ST'],
   '7v7':   ['GK', 'LB', 'CB', 'RB', 'CM', 'LW', 'ST'],
@@ -31,7 +28,7 @@ export function buildInitialSlots(fmt?: string, overridePositions?: string[]): S
   return [...a, ...b];
 }
 
-/** Eski tek listeden (pos sadece string) yeni yapıya çevirme. */
+/** Eski tek listeden (team alanı olmayan) yeni yapıya çevirir. */
 export function upgradeLegacySlots(raw: any, fmt?: string): Slot[] {
   // Zaten yeni format mı?
   if (Array.isArray(raw) && raw.length && typeof raw[0] === 'object' && 'team' in raw[0]) {
@@ -44,11 +41,14 @@ export function upgradeLegacySlots(raw: any, fmt?: string): Slot[] {
   const a: Slot[] = base.map(pos => ({ team: 'A' as const, pos, userId: null }));
   const b: Slot[] = base.map(pos => ({ team: 'B' as const, pos, userId: null }));
 
-  // Eski raw: [{pos:'GK', userId?}, ...] ya da sadece ['GK', ...] olabilir
+  // Eski raw: [{pos:'GK', userId?}, ...] veya sadece ['GK', ...] olabilir
   const legacy = Array.isArray(raw) ? raw : [];
   let i = 0;
   for (const item of legacy) {
-    const uid = (item && typeof item === 'object') ? (item.userId ?? null) : null;
+    const uid =
+      item && typeof item === 'object'
+        ? (item.userId ?? null)
+        : null;
     if (!uid) continue;
 
     const target = i < a.length ? a[i] : b[i - a.length];
@@ -59,9 +59,11 @@ export function upgradeLegacySlots(raw: any, fmt?: string): Slot[] {
   return [...a, ...b];
 }
 
-/** normalizeSlots: dışarıdan bu isimle kullanmak isteyen controller’lar için kısayol */
+/** Güvenli normalize: boş/yanlış ise format’a göre sıfırdan doldurur. */
 export function normalizeSlots(raw: any, fmt?: string): Slot[] {
-  return upgradeLegacySlots(raw, fmt);
+  const up = upgradeLegacySlots(raw, fmt);
+  if (Array.isArray(up) && up.length > 0) return up;
+  return buildInitialSlots(fmt);
 }
 
 /** Dengeye göre otomatik takım seçer. */

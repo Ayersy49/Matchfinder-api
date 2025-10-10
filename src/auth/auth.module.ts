@@ -3,10 +3,11 @@ import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtStrategy } from './jwt.strategy';
-
-import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
+import { AuthService } from './auth.service';
 import { UsersModule } from '../users/users.module';
+// ↓↓↓ EKLE
+import { DevAuthController } from './dev-auth.controller';
 
 @Module({
   imports: [
@@ -17,12 +18,12 @@ import { UsersModule } from '../users/users.module';
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET'),
+        secret: config.get<string>('JWT_SECRET') || 'dev-secret',
         signOptions: { expiresIn: '7d' },
       }),
     }),
   ],
-  controllers: [AuthController],
+  controllers: [AuthController, DevAuthController], // ← EKLİ
   providers: [AuthService, JwtStrategy],
   exports: [JwtModule, PassportModule],
 })
