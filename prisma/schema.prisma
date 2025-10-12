@@ -15,6 +15,13 @@ enum DominantFoot {
   N
 }
 
+enum FriendRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+}
+
 model User {
   id                 String       @id @default(cuid())
   phone              String       @unique
@@ -22,15 +29,61 @@ model User {
   positions          Json
   positionLevels     Json?
   availability       Json?
-  preferredFormation String? // "4-2-3-1" | "4-3-3" | "3-5-2"
+  preferredFormation String?
   level              Int          @default(5)
-  createdAt          DateTime     @default(now())
-  updatedAt          DateTime     @updatedAt
 
-  // İstersen ilişki geri tarafı:
-  // messages          Message[]    // gerekmez ama ekleyebilirsin
+  // keşif için
+  lat          Float?
+  lng          Float?
+  discoverable Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Friend request ilişkileri
+  sentFriendRequests     FriendRequest[] @relation("FriendRequestFrom")
+  receivedFriendRequests FriendRequest[] @relation("FriendRequestTo")
+
+  // Friendship ilişkileri
+  userFriends Friendship[] @relation("UserFriends")
+  friendsOf   Friendship[] @relation("UserFriendsOf")
+
+  // Mevcut ilişkilerin
   Message Message[]
   Match   Match[]
+
+  @@index([lat, lng])
+}
+
+model FriendRequest {
+  id        String              @id @default(cuid())
+  fromId    String
+  toId      String
+  status    FriendRequestStatus @default(PENDING)
+  message   String? // <— BUNU İSTİYORUZ
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  from User @relation("FriendRequestFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to   User @relation("FriendRequestTo", fields: [toId], references: [id], onDelete: Cascade)
+
+  @@unique([fromId, toId])
+  @@index([toId])
+  @@index([fromId])
+}
+
+model Friendship {
+  id        String   @id @default(cuid())
+  userId    String
+  friendId  String
+  createdAt DateTime @default(now())
+
+  user   User @relation("UserFriends", fields: [userId], references: [id], onDelete: Cascade)
+  friend User @relation("UserFriendsOf", fields: [friendId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, friendId])
+  @@index([friendId])
+  @@index([userId])
 }
 
 model Message {
@@ -48,12 +101,12 @@ model Message {
 model Match {
   id       String   @id @default(cuid())
   title    String
-  location String? // "Beşiktaş Halısaha" gibi
-  level    String   @default("Orta") // "Kolay" | "Orta" | "Zor"
-  format   String   @default("7v7") // "5v5" | "7v7" | "8v8" | "11v11"
-  price    Int? // ₺ cinsinden
-  time     DateTime @default(now()) // maç saati (şimdilik)
-  slots    Json     @default("[]") // [{pos:"GK", userId:null}, ...] basit JSON
+  location String?
+  level    String   @default("Orta")
+  format   String   @default("7v7")
+  price    Int?
+  time     DateTime @default(now())
+  slots    Json     @default("[]")
   ownerId  String?
   owner    User?    @relation(fields: [ownerId], references: [id])
 

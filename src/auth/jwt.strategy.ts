@@ -14,9 +14,13 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
   }
 
   async validate(payload: any) {
-    // token’da id/sub/userId her ne geldiyse normalize et
-    const id = payload?.id || payload?.sub || payload?.userId;
-    // Guard 'req.user' içine döndürdüğümüz obje konur
-    return id ? { id } : null;
+    // Token içindeki alanları normalize et
+    const sub = payload?.sub ?? payload?.id ?? payload?.userId ?? null;
+    const phone = payload?.phone ?? null;
+
+    // Guard, return ettiğinizi req.user içine koyar
+    // UsersController 'req.user.sub' ve 'req.user.phone' bekliyor
+    return sub ? { sub, phone } : null;
   }
+
 }

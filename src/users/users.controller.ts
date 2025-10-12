@@ -7,8 +7,9 @@ import {
   Req,
   UseGuards,
   UnauthorizedException,
+  Query, // <-- eklendi
 } from '@nestjs/common';
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma } from '@prisma/client'; // PrismaClient kullanılmıyor; sadece Prisma yeterli
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthGuard } from '@nestjs/passport';
 import {
@@ -17,23 +18,24 @@ import {
   IsArray,
   IsEnum,
   IsInt,
+  IsNumber,
   IsObject,
   IsOptional,
+  IsBoolean,
   Max,
   Min,
 } from 'class-validator';
 
-/** ---- Yardımcı: Json cast (Prisma InputJsonValue beklentisi) ---- */
+/** ---- Json cast helper ---- */
 const J = (v: unknown) => v as unknown as Prisma.InputJsonValue;
 
-/** ---- Domain tipleri/const'lar ---- */
+/** ---- Domain ---- */
 enum DominantFoot {
   L = 'L',
   R = 'R',
-  B = 'B', // both
-  N = 'N', // none
+  B = 'B',
+  N = 'N',
 }
-
 const ALLOWED_POSITIONS = [
   'GK', 'LB', 'CB', 'RB', 'LWB', 'RWB', 'DM', 'CM', 'AM', 'LW', 'RW', 'ST',
 ] as const;
@@ -55,35 +57,42 @@ const DEFAULT_AVAILABILITY: Availability = {
   sun: { enabled: false, start: '20:00', end: '23:59' },
 };
 
-/** ---- DTO ---- */
+/** ---- DTO'lar ---- */
 class UpdateMeDto {
-  @IsOptional()
-  @IsEnum(DominantFoot)
-  dominantFoot?: DominantFoot;
+  @IsOptional() @IsEnum(DominantFoot) dominantFoot?: DominantFoot;
+  @IsOptional() preferredFormation?: '4-2-3-1' | '4-3-3' | '3-5-2';
 
-  @IsOptional()
-  // sadece bu üç değer
-  preferredFormation?: '4-2-3-1' | '4-3-3' | '3-5-2';
-
-  @IsOptional()
-  @IsArray()
-  @ArrayMaxSize(3)
-  @ArrayUnique()
+  @IsOptional() @IsArray() @ArrayMaxSize(3) @ArrayUnique()
   positions?: PositionKey[];
 
-  @IsOptional()
-  @IsInt()
-  @Min(1)
-  @Max(10)
+  @IsOptional() @IsInt() @Min(1) @Max(10)
   level?: number;
 
-  @IsOptional()
-  @IsObject()
+  @IsOptional() @IsObject()
   positionLevels?: Record<string, number>;
 
-  @IsOptional()
-  @IsObject()
+  @IsOptional() @IsObject()
   availability?: Partial<Availability>;
+
+  // opsiyonel: aynı endpoint’ten de güncellenebilmesi için
+  @IsOptional() @IsBoolean()
+  discoverable?: boolean;
+
+  @IsOptional() @IsNumber()
+  lat?: number;
+
+  @IsOptional() @IsNumber()
+  lng?: number;
+}
+
+class DiscoverableDto {
+  @IsOptional() @IsBoolean()
+  value?: boolean; // verilirse set, verilmezse toggle
+}
+
+class LocationDto {
+  @IsNumber() lat!: number;
+  @IsNumber() lng!: number;
 }
 
 /** ---- Controller ---- */
@@ -100,7 +109,6 @@ export class UsersController {
 
     let user = id ? await this.prisma.user.findUnique({ where: { id } }) : null;
 
-    // yoksa telefonla oluştur (JSON alanlara cast’lere dikkat!)
     if (!user && phoneDigits) {
       user = await this.prisma.user.upsert({
         where: { phone: phoneDigits },
@@ -113,16 +121,13 @@ export class UsersController {
           level: 5,
           dominantFoot: 'N',
           preferredFormation: '4-2-3-1',
+          discoverable: false,
         },
       });
     }
-
     if (!user) throw new UnauthorizedException();
 
-    // Güvenli dönüş (Json alanlar bozuksa fallback ver)
-    const safePositions = Array.isArray(user.positions)
-      ? (user.positions as any[])
-      : [];
+    const safePositions = Array.isArray(user.positions) ? (user.positions as any[]) : [];
     const safeLevels =
       user.positionLevels && typeof user.positionLevels === 'object'
         ? (user.positionLevels as Record<string, number>)
@@ -141,6 +146,10 @@ export class UsersController {
       positionLevels: safeLevels,
       availability: safeAvail,
       level: user.level ?? 5,
+      // keşif için
+      lat: user.lat ?? null,
+      lng: user.lng ?? null,
+      discoverable: !!user.discoverable,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
     };
@@ -153,6 +162,25 @@ export class UsersController {
     const id = req.user?.sub as string | undefined;
     const phoneDigits = String(req.user?.phone ?? '').replace(/\D/g, '');
 
+    let user = id ? await this.prisma.user.findUnique({ where: { id } }) : null;
+    if (!user && phoneDigits) {
+      user = await this.prisma.user.upsert({
+        where: { phone: phoneDigits },
+        update: {},
+        create: {
+          phone: phoneDigits,
+          positions: J([]),
+          positionLevels: J({}),
+          availability: J(DEFAULT_AVAILABILITY),
+          level: 5,
+          dominantFoot: 'N',
+          preferredFormation: '4-2-3-1',
+          discoverable: false,
+        },
+      });
+    }
+    if (!user) throw new UnauthorizedException();
+
     // positions
     let positions: PositionKey[] | undefined;
     if (dto.positions) {
@@ -161,7 +189,7 @@ export class UsersController {
         .slice(0, 3) as PositionKey[];
     }
 
-    // positionLevels (sadece izin verilen pozisyonlar ve 1..10)
+    // positionLevels (1..10, izinli pozisyonlar)
     let positionLevels: Record<string, number> | undefined;
     if (dto.positionLevels && typeof dto.positionLevels === 'object') {
       positionLevels = {};
@@ -197,44 +225,149 @@ export class UsersController {
       availability = merged as Availability;
     }
 
-    // kullanıcıyı bul/oluştur
-    let user = id ? await this.prisma.user.findUnique({ where: { id } }) : null;
-    if (!user && phoneDigits) {
-      user = await this.prisma.user.upsert({
-        where: { phone: phoneDigits },
-        update: {},
-        create: {
-          phone: phoneDigits,
-          positions: [] as unknown as Prisma.InputJsonValue,
-          positionLevels: {} as unknown as Prisma.InputJsonValue,
-          availability: DEFAULT_AVAILABILITY as unknown as Prisma.InputJsonValue,
-          level: 5,
-          dominantFoot: 'N',
-          preferredFormation: '4-2-3-1',
-        },
-      });
-    }
-    if (!user) throw new UnauthorizedException();
-
-    // yazılacak veri – JSON alanları J(...) ile cast ediyoruz
     const data: Prisma.UserUpdateInput = {};
     if (dto.dominantFoot) data.dominantFoot = dto.dominantFoot;
     if (positions) data.positions = J(positions);
     if (typeof dto.level === 'number') data.level = Math.max(1, Math.min(10, dto.level));
     if (positionLevels) data.positionLevels = J(positionLevels);
     if (availability) data.availability = J(availability);
-    if (
-      dto.preferredFormation &&
-      ['4-2-3-1', '4-3-3', '3-5-2'].includes(dto.preferredFormation)
-    ) {
+    if (dto.preferredFormation && ['4-2-3-1', '4-3-3', '3-5-2'].includes(dto.preferredFormation)) {
       (data as any).preferredFormation = dto.preferredFormation;
     }
+    if (typeof dto.discoverable === 'boolean') data.discoverable = dto.discoverable;
+    if (typeof dto.lat === 'number' && typeof dto.lng === 'number') {
+      const latOk = dto.lat >= -90 && dto.lat <= 90;
+      const lngOk = dto.lng >= -180 && dto.lng <= 180;
+      if (latOk && lngOk) {
+        (data as any).lat = dto.lat;
+        (data as any).lng = dto.lng;
+      }
+    }
 
-    const updated = await this.prisma.user.update({
-      where: { id: user.id },
-      data,
+    const updated = await this.prisma.user.update({ where: { id: user.id }, data });
+    return updated;
+  }
+
+  /** Keşifte görünürlüğü aç/kapat (value verilmezse toggle) */
+  @UseGuards(AuthGuard('jwt'))
+  @Put('me/discoverable')
+  async setDiscoverable(@Req() req: any, @Body() body: DiscoverableDto) {
+    const id = req.user?.sub as string | undefined;
+    if (!id) throw new UnauthorizedException();
+
+    const me = await this.prisma.user.findUnique({ where: { id } });
+    if (!me) throw new UnauthorizedException();
+
+    const next =
+      typeof body.value === 'boolean' ? body.value : !Boolean(me.discoverable);
+
+    await this.prisma.user.update({
+      where: { id },
+      data: { discoverable: next },
     });
 
-    return updated;
+    return { ok: true, discoverable: next };
+  }
+
+  /** Konumu yaz (lat,lng) */
+  @UseGuards(AuthGuard('jwt'))
+  @Put('me/location')
+  async setLocation(@Req() req: any, @Body() body: LocationDto) {
+    const id = req.user?.sub as string | undefined;
+    if (!id) throw new UnauthorizedException();
+
+    const latOk = body.lat >= -90 && body.lat <= 90;
+    const lngOk = body.lng >= -180 && body.lng <= 180;
+    if (!latOk || !lngOk) {
+      return { ok: false, message: 'invalid_lat_lng' };
+    }
+
+    await this.prisma.user.update({
+      where: { id },
+      data: { lat: body.lat, lng: body.lng },
+    });
+
+    return { ok: true };
+  }
+
+  /** Yakındaki oyuncular – /users/discover?lat=..&lng=..&radiusKm=..  */
+  @UseGuards(AuthGuard('jwt'))
+  @Get('discover')
+  async discover(
+    @Req() req: any,
+    @Query('lat') latQ?: string,
+    @Query('lng') lngQ?: string,
+    @Query('radiusKm') radiusQ?: string,
+  ) {
+    const meId = req.user?.sub as string | undefined;
+    if (!meId) throw new UnauthorizedException();
+
+    // yarıçap
+    const radiusKm = Math.max(1, Math.min(200, Number(radiusQ) || 30));
+
+    // baz konum: query yoksa kullanıcının kendi konumu
+    let baseLat = Number(latQ);
+    let baseLng = Number(lngQ);
+    if (!Number.isFinite(baseLat) || !Number.isFinite(baseLng)) {
+      const me = await this.prisma.user.findUnique({
+        where: { id: meId },
+        select: { lat: true, lng: true },
+      });
+      if (!me?.lat || !me?.lng) return { items: [] as any[] };
+      baseLat = me.lat!;
+      baseLng = me.lng!;
+    }
+
+    // adaylar
+    const candidates = await this.prisma.user.findMany({
+      where: {
+        discoverable: true,
+        id: { not: meId },
+        lat: { not: null },
+        lng: { not: null },
+      },
+      select: {
+        id: true,
+        phone: true,
+        level: true,
+        positions: true,
+        lat: true,
+        lng: true,
+      },
+    });
+
+    // Haversine
+    const toRad = (x: number) => (x * Math.PI) / 180;
+    const haversineKm = (aLat: number, aLng: number, bLat: number, bLng: number) => {
+      const R = 6371;
+      const dLat = toRad(bLat - aLat);
+      const dLng = toRad(bLng - aLng);
+      const sa =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(sa), Math.sqrt(1 - sa));
+      return R * c;
+    };
+
+    const items = candidates
+      .map((u) => {
+        const dist = haversineKm(baseLat, baseLng, Number(u.lat), Number(u.lng));
+        let pos: string[] | null = null;
+        if (Array.isArray(u.positions)) pos = (u.positions as any[]).map(String);
+        return {
+          id: u.id,
+          phone: u.phone ?? null,
+          level: u.level ?? null,
+          positions: pos,
+          lat: Number(u.lat),
+          lng: Number(u.lng),
+          distanceKm: dist,
+        };
+      })
+      .filter((x) => x.distanceKm <= radiusKm)
+      .sort((a, b) => a.distanceKm - b.distanceKm)
+      .slice(0, 100);
+
+    return { items };
   }
 }

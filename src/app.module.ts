@@ -8,10 +8,13 @@ import { PrismaModule } from './prisma/prisma.module';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { MessagesModule } from './messages/messages.module';
+import { FriendsModule } from './friends/friends.module';
+
 
 @Module({
   imports: [
     MessagesModule,
+    FriendsModule,
     // .env'i global yükle
     ConfigModule.forRoot({ isGlobal: true }),
     
