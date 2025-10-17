@@ -1,106 +1,132 @@
-// src/users/users.controller.ts
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
   Put,
+  Post,
   Req,
   UseGuards,
   UnauthorizedException,
-  Query, // <-- eklendi
+  Param,
+  Query,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client'; // PrismaClient kullanılmıyor; sadece Prisma yeterli
-import { PrismaService } from '../prisma/prisma.service';
 import { AuthGuard } from '@nestjs/passport';
-import {
-  ArrayMaxSize,
-  ArrayUnique,
-  IsArray,
-  IsEnum,
-  IsInt,
-  IsNumber,
-  IsObject,
-  IsOptional,
-  IsBoolean,
-  Max,
-  Min,
-} from 'class-validator';
+import { Prisma } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
 
-/** ---- Json cast helper ---- */
+/* ----------------- Helpers / Types ----------------- */
+
 const J = (v: unknown) => v as unknown as Prisma.InputJsonValue;
 
-/** ---- Domain ---- */
-enum DominantFoot {
-  L = 'L',
-  R = 'R',
-  B = 'B',
-  N = 'N',
-}
+type DayKey = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
+type Interval = { start: string; end: string };
+type Avail = Record<DayKey, Interval[]>;
+
+const DAY_KEYS: DayKey[] = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+const DOW_TO_KEY: Record<number, DayKey> = {
+  1: 'mon', 2: 'tue', 3: 'wed', 4: 'thu', 5: 'fri', 6: 'sat', 7: 'sun',
+};
+
+const EMPTY_AVAIL: Avail = { mon: [], tue: [], wed: [], thu: [], fri: [], sat: [], sun: [] };
+
 const ALLOWED_POSITIONS = [
   'GK', 'LB', 'CB', 'RB', 'LWB', 'RWB', 'DM', 'CM', 'AM', 'LW', 'RW', 'ST',
 ] as const;
-type PositionKey = (typeof ALLOWED_POSITIONS)[number];
 
-type AvDay = { enabled: boolean; start: string; end: string };
-type Availability = Record<
-  'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun',
-  AvDay
->;
-
-const DEFAULT_AVAILABILITY: Availability = {
-  mon: { enabled: false, start: '20:00', end: '23:59' },
-  tue: { enabled: false, start: '20:00', end: '23:59' },
-  wed: { enabled: false, start: '20:00', end: '23:59' },
-  thu: { enabled: false, start: '20:00', end: '23:59' },
-  fri: { enabled: false, start: '20:00', end: '23:59' },
-  sat: { enabled: false, start: '20:00', end: '23:59' },
-  sun: { enabled: false, start: '20:00', end: '23:59' },
-};
-
-/** ---- DTO'lar ---- */
-class UpdateMeDto {
-  @IsOptional() @IsEnum(DominantFoot) dominantFoot?: DominantFoot;
-  @IsOptional() preferredFormation?: '4-2-3-1' | '4-3-3' | '3-5-2';
-
-  @IsOptional() @IsArray() @ArrayMaxSize(3) @ArrayUnique()
-  positions?: PositionKey[];
-
-  @IsOptional() @IsInt() @Min(1) @Max(10)
-  level?: number;
-
-  @IsOptional() @IsObject()
-  positionLevels?: Record<string, number>;
-
-  @IsOptional() @IsObject()
-  availability?: Partial<Availability>;
-
-  // opsiyonel: aynı endpoint’ten de güncellenebilmesi için
-  @IsOptional() @IsBoolean()
-  discoverable?: boolean;
-
-  @IsOptional() @IsNumber()
-  lat?: number;
-
-  @IsOptional() @IsNumber()
-  lng?: number;
+function getUserId(req: any): string | undefined {
+  return req?.user?.id || req?.user?.sub || req?.user?.userId || undefined;
 }
 
-class DiscoverableDto {
-  @IsOptional() @IsBoolean()
-  value?: boolean; // verilirse set, verilmezse toggle
+const isTime = (s: any) =>
+  typeof s === 'string' &&
+  /^\d{2}:\d{2}$/.test(s) &&
+  +s.slice(0, 2) >= 0 && +s.slice(0, 2) <= 23 &&
+  +s.slice(3, 5) >= 0 && +s.slice(3, 5) <= 59;
+
+function mergeIntervals(list: Interval[]): Interval[] {
+  const arr = list
+    .filter((x) => isTime(x.start) && isTime(x.end) && x.start < x.end)
+    .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+
+  const out: Interval[] = [];
+  for (const cur of arr) {
+    const last = out[out.length - 1];
+    if (last && cur.start <= last.end) {
+      last.end = cur.end > last.end ? cur.end : last.end;
+    } else {
+      out.push({ ...cur });
+    }
+  }
+  return out;
 }
 
-class LocationDto {
-  @IsNumber() lat!: number;
-  @IsNumber() lng!: number;
+/** Her türlü payload'ı (yeni veya legacy) Avail formatına normalize eder. */
+function normalizeAvail(input: any): Avail {
+  let src = input;
+  if (src && typeof src === 'object' && 'availability' in src) {
+    src = (src as any).availability;
+  }
+
+  // 1) Yeni format: { mon:[{start,end}], ... }
+  if (src && typeof src === 'object' && !Array.isArray(src)) {
+    const out: Avail = { ...EMPTY_AVAIL };
+    for (const k of DAY_KEYS) {
+      const raw = Array.isArray((src as any)[k]) ? (src as any)[k] : [];
+      out[k] = mergeIntervals(
+        raw.map((r: any) => ({ start: String(r?.start || ''), end: String(r?.end || '') })),
+      );
+    }
+    return out;
+  }
+
+  // 2) Legacy: { items:[{ dow:1..7, start, end }]} veya doğrudan dizi
+  const arr = Array.isArray((src as any)?.items) ? (src as any).items : src;
+  if (!Array.isArray(arr)) throw new BadRequestException('invalid_payload');
+
+  const buckets: Avail = { ...EMPTY_AVAIL };
+  for (const it of arr) {
+    const dow = Number((it as any)?.dow);
+    const start = String((it as any)?.start || '');
+    const end = String((it as any)?.end || '');
+    if (!(dow >= 1 && dow <= 7 && isTime(start) && isTime(end) && start < end)) continue;
+    buckets[DOW_TO_KEY[dow]].push({ start, end });
+  }
+  for (const k of DAY_KEYS) buckets[k] = mergeIntervals(buckets[k]);
+  return buckets;
 }
 
-/** ---- Controller ---- */
+/** DB'deki karışık yapıları (legacy/new) güvenle yeni formata döndürür. */
+function coerceFromDb(raw: any): Avail {
+  try {
+    if (!raw) return { ...EMPTY_AVAIL };
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      return normalizeAvail({ availability: raw });
+    }
+    if (Array.isArray(raw)) {
+      return normalizeAvail({ items: raw });
+    }
+    return { ...EMPTY_AVAIL };
+  } catch {
+    return { ...EMPTY_AVAIL };
+  }
+}
+
+/** davranış skoru rengi */
+function colorOf(total: number) {
+  if (total >= 90) return 'blue';
+  if (total >= 60) return 'green';
+  if (total >= 40) return 'yellow';
+  return 'red';
+}
+
+/* ----------------- Controller ----------------- */
+
 @Controller('users')
 export class UsersController {
   constructor(private readonly prisma: PrismaService) {}
 
-  /** Kimlikli kullanıcıyı getir (yoksa phone ile oluştur) */
+  /** Kimlikli kullanıcı (yoksa phone’dan upsert) */
   @UseGuards(AuthGuard('jwt'))
   @Get('me')
   async me(@Req() req: any) {
@@ -117,7 +143,7 @@ export class UsersController {
           phone: phoneDigits,
           positions: J([]),
           positionLevels: J({}),
-          availability: J(DEFAULT_AVAILABILITY),
+          availability: J(EMPTY_AVAIL),
           level: 5,
           dominantFoot: 'N',
           preferredFormation: '4-2-3-1',
@@ -132,21 +158,17 @@ export class UsersController {
       user.positionLevels && typeof user.positionLevels === 'object'
         ? (user.positionLevels as Record<string, number>)
         : {};
-    const safeAvail =
-      user.availability && typeof user.availability === 'object'
-        ? ({ ...DEFAULT_AVAILABILITY, ...(user.availability as any) } as Availability)
-        : DEFAULT_AVAILABILITY;
+    const safeAvail = coerceFromDb(user.availability);
 
     return {
       id: user.id,
       phone: user.phone ?? phoneDigits ?? null,
-      dominantFoot: (user.dominantFoot as DominantFoot) ?? 'N',
+      dominantFoot: (user.dominantFoot as any) ?? 'N',
       positions: safePositions,
       preferredFormation: (user.preferredFormation as any) ?? '4-2-3-1',
       positionLevels: safeLevels,
       availability: safeAvail,
       level: user.level ?? 5,
-      // keşif için
       lat: user.lat ?? null,
       lng: user.lng ?? null,
       discoverable: !!user.discoverable,
@@ -155,87 +177,53 @@ export class UsersController {
     };
   }
 
-  /** Profili güncelle */
+  /** Profili güncelle (availability yeni/legacy format) */
   @UseGuards(AuthGuard('jwt'))
   @Put('me')
-  async update(@Req() req: any, @Body() dto: UpdateMeDto) {
-    const id = req.user?.sub as string | undefined;
-    const phoneDigits = String(req.user?.phone ?? '').replace(/\D/g, '');
-
-    let user = id ? await this.prisma.user.findUnique({ where: { id } }) : null;
-    if (!user && phoneDigits) {
-      user = await this.prisma.user.upsert({
-        where: { phone: phoneDigits },
-        update: {},
-        create: {
-          phone: phoneDigits,
-          positions: J([]),
-          positionLevels: J({}),
-          availability: J(DEFAULT_AVAILABILITY),
-          level: 5,
-          dominantFoot: 'N',
-          preferredFormation: '4-2-3-1',
-          discoverable: false,
-        },
-      });
-    }
-    if (!user) throw new UnauthorizedException();
-
-    // positions
-    let positions: PositionKey[] | undefined;
-    if (dto.positions) {
-      positions = dto.positions
-        .filter((p) => (ALLOWED_POSITIONS as readonly string[]).includes(p))
-        .slice(0, 3) as PositionKey[];
-    }
-
-    // positionLevels (1..10, izinli pozisyonlar)
-    let positionLevels: Record<string, number> | undefined;
-    if (dto.positionLevels && typeof dto.positionLevels === 'object') {
-      positionLevels = {};
-      for (const [k, v] of Object.entries(dto.positionLevels)) {
-        if ((ALLOWED_POSITIONS as readonly string[]).includes(k)) {
-          const n = Math.max(1, Math.min(10, Number(v)));
-          positionLevels[k] = n;
-        }
-      }
-      if (positions) {
-        positionLevels = Object.fromEntries(
-          Object.entries(positionLevels).filter(([k]) =>
-            positions!.includes(k as PositionKey),
-          ),
-        );
-      }
-    }
-
-    // availability normalize
-    let availability: Availability | undefined;
-    if (dto.availability && typeof dto.availability === 'object') {
-      const merged: any = { ...DEFAULT_AVAILABILITY };
-      for (const k of Object.keys(DEFAULT_AVAILABILITY) as Array<keyof Availability>) {
-        const d = (dto.availability as any)[k];
-        if (!d) continue;
-        const ok = (s: any) => typeof s === 'string' && /^\d{2}:\d{2}$/.test(s);
-        merged[k] = {
-          enabled: !!d.enabled,
-          start: ok(d.start) ? d.start : DEFAULT_AVAILABILITY[k].start,
-          end: ok(d.end) ? d.end : DEFAULT_AVAILABILITY[k].end,
-        };
-      }
-      availability = merged as Availability;
-    }
+  async update(@Req() req: any, @Body() dto: any) {
+    const id = getUserId(req);
+    if (!id) throw new UnauthorizedException();
 
     const data: Prisma.UserUpdateInput = {};
-    if (dto.dominantFoot) data.dominantFoot = dto.dominantFoot;
-    if (positions) data.positions = J(positions);
-    if (typeof dto.level === 'number') data.level = Math.max(1, Math.min(10, dto.level));
-    if (positionLevels) data.positionLevels = J(positionLevels);
-    if (availability) data.availability = J(availability);
-    if (dto.preferredFormation && ['4-2-3-1', '4-3-3', '3-5-2'].includes(dto.preferredFormation)) {
+
+    if (dto?.dominantFoot && ['L', 'R', 'B', 'N'].includes(dto.dominantFoot)) {
+      (data as any).dominantFoot = dto.dominantFoot;
+    }
+    if (typeof dto?.level === 'number') {
+      data.level = Math.max(1, Math.min(10, dto.level));
+    }
+
+    if (Array.isArray(dto?.positions)) {
+      const allowed = new Set(ALLOWED_POSITIONS as readonly string[]);
+      const list = dto.positions.filter((p: any) => allowed.has(String(p))).slice(0, 3);
+      data.positions = J(list);
+    }
+
+    if (dto?.positionLevels && typeof dto.positionLevels === 'object') {
+      const allowed = new Set(ALLOWED_POSITIONS as readonly string[]);
+      const pl: Record<string, number> = {};
+      for (const [k, v] of Object.entries(dto.positionLevels)) {
+        if (!allowed.has(k)) continue;
+        const n = Math.max(1, Math.min(10, Number(v)));
+        pl[k] = n;
+      }
+      data.positionLevels = J(pl);
+    }
+
+    if (dto?.availability || (dto?.items && Array.isArray(dto.items))) {
+      const normalized = normalizeAvail(dto);
+      data.availability = J(normalized);
+    }
+
+    if (dto?.preferredFormation && ['4-2-3-1', '4-3-3', '3-5-2'].includes(dto.preferredFormation)) {
       (data as any).preferredFormation = dto.preferredFormation;
     }
-    if (typeof dto.discoverable === 'boolean') data.discoverable = dto.discoverable;
-    if (typeof dto.lat === 'number' && typeof dto.lng === 'number') {
+
+    if (typeof dto?.discoverable === 'boolean') {
+      (data as any).discoverable = dto.discoverable;
+    }
+
+    if (typeof dto?.lat === 'number' && typeof dto?.lng === 'number') {
       const latOk = dto.lat >= -90 && dto.lat <= 90;
       const lngOk = dto.lng >= -180 && dto.lng <= 180;
       if (latOk && lngOk) {
@@ -244,27 +232,37 @@ export class UsersController {
       }
     }
 
-    const updated = await this.prisma.user.update({ where: { id: user.id }, data });
-    return updated;
+    const updated = await this.prisma.user.update({ where: { id }, data });
+    return {
+      id: updated.id,
+      positions: Array.isArray(updated.positions) ? (updated.positions as any[]) : [],
+      positionLevels:
+        updated.positionLevels && typeof updated.positionLevels === 'object'
+          ? (updated.positionLevels as Record<string, number>)
+          : {},
+      availability: coerceFromDb(updated.availability),
+      level: updated.level,
+      dominantFoot: updated.dominantFoot,
+      preferredFormation: updated.preferredFormation,
+      lat: updated.lat ?? null,
+      lng: updated.lng ?? null,
+      discoverable: !!updated.discoverable,
+      updatedAt: updated.updatedAt,
+    };
   }
 
   /** Keşifte görünürlüğü aç/kapat (value verilmezse toggle) */
   @UseGuards(AuthGuard('jwt'))
   @Put('me/discoverable')
-  async setDiscoverable(@Req() req: any, @Body() body: DiscoverableDto) {
-    const id = req.user?.sub as string | undefined;
+  async setDiscoverable(@Req() req: any, @Body() body: any) {
+    const id = getUserId(req);
     if (!id) throw new UnauthorizedException();
 
     const me = await this.prisma.user.findUnique({ where: { id } });
     if (!me) throw new UnauthorizedException();
 
-    const next =
-      typeof body.value === 'boolean' ? body.value : !Boolean(me.discoverable);
-
-    await this.prisma.user.update({
-      where: { id },
-      data: { discoverable: next },
-    });
+    const next = typeof body?.value === 'boolean' ? body.value : !Boolean(me.discoverable);
+    await this.prisma.user.update({ where: { id }, data: { discoverable: next } });
 
     return { ok: true, discoverable: next };
   }
@@ -272,25 +270,160 @@ export class UsersController {
   /** Konumu yaz (lat,lng) */
   @UseGuards(AuthGuard('jwt'))
   @Put('me/location')
-  async setLocation(@Req() req: any, @Body() body: LocationDto) {
-    const id = req.user?.sub as string | undefined;
+  async setLocation(@Req() req: any, @Body() body: any) {
+    const id = getUserId(req);
     if (!id) throw new UnauthorizedException();
 
-    const latOk = body.lat >= -90 && body.lat <= 90;
-    const lngOk = body.lng >= -180 && body.lng <= 180;
-    if (!latOk || !lngOk) {
-      return { ok: false, message: 'invalid_lat_lng' };
-    }
+    const lat = Number(body?.lat);
+    const lng = Number(body?.lng);
+    const latOk = Number.isFinite(lat) && lat >= -90 && lat <= 90;
+    const lngOk = Number.isFinite(lng) && lng >= -180 && lng <= 180;
+    if (!latOk || !lngOk) throw new BadRequestException('invalid_lat_lng');
 
-    await this.prisma.user.update({
-      where: { id },
-      data: { lat: body.lat, lng: body.lng },
-    });
-
+    await this.prisma.user.update({ where: { id }, data: { lat, lng } });
     return { ok: true };
   }
 
-  /** Yakındaki oyuncular – /users/discover?lat=..&lng=..&radiusKm=..  */
+  /** Başkasının herkese açık profili (arkadaşa availability göster) */
+  @UseGuards(AuthGuard('jwt'))
+  @Get(':id/public-profile')
+  async publicProfile(@Req() req: any, @Param('id') id: string) {
+    const meId = getUserId(req);
+    if (!meId) throw new UnauthorizedException();
+
+    const isFriend = !!(await this.prisma.friendship.findFirst({
+      where: { OR: [{ userId: meId, friendId: id }, { userId: id, friendId: meId }] },
+    }));
+
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      select: { id: true, level: true, positions: true, positionLevels: true, preferredFormation: true },
+    });
+    if (!user) throw new BadRequestException('user_not_found');
+
+    const availability = isFriend
+      ? coerceFromDb((await this.prisma.user.findUnique({ where: { id }, select: { availability: true } }))?.availability)
+      : null;
+
+    return {
+      user: {
+        ...user,
+        positions: Array.isArray(user.positions) ? (user.positions as any[]) : [],
+        positionLevels:
+          user.positionLevels && typeof user.positionLevels === 'object'
+            ? (user.positionLevels as Record<string, number>)
+            : {},
+      },
+      availability,
+      isFriend,
+    };
+  }
+
+  /* ---------- Müsaitlik Endpoints (Yeni Format) ---------- */
+
+  @UseGuards(AuthGuard('jwt'))
+  @Get('me/availability')
+  async getMyAvailability(@Req() req: any) {
+    const userId = getUserId(req);
+    if (!userId) throw new BadRequestException('no_user');
+
+    const me = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { availability: true },
+    });
+
+    const availability = coerceFromDb(me?.availability);
+    return { availability };
+  }
+
+  @UseGuards(AuthGuard('jwt'))
+  @Post('me/availability')
+  async setMyAvailability(@Req() req: any, @Body() body: any) {
+    const userId = getUserId(req);
+    if (!userId) throw new BadRequestException('no_user');
+
+    const availability = normalizeAvail(body);
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { availability: J(availability) },
+      select: { id: true },
+    });
+
+    return { ok: true, availability };
+  }
+
+  /** Davranış özeti (ağırlıklı) – eski kolon adlarıyla */
+  @Get(':id/behavior')
+  async behavior(@Param('id') id: string) {
+    const rows = await this.prisma.rating.findMany({
+      where: { ratedId: id }, // DİKKAT: Prisma alanı ratedId
+      select: { traits: true, weight: true },
+      orderBy: { createdAt: 'desc' },
+      take: 1000,
+    });
+
+    if (!rows.length) {
+      return { avg: null, si: 70, total: 70, color: 'green', samples: 0 };
+    }
+
+    let wsum = 0, P=0, R=0, S=0, W=0, A=0;
+    for (const r of rows) {
+      const w = r.weight || 1;
+      const t = (r.traits || {}) as any;
+      const p  = Number(t.punctuality)   || 0;
+      const rs = Number(t.respect)       || 0;
+      const sp = Number(t.sportsmanship) || 0;
+      const sw = Number(t.swearing)      || 0;
+      const ag = Number(t.aggression)    || 0;
+      wsum += w;
+      P += w * p; R += w * rs; S += w * sp; W += w * sw; A += w * ag;
+    }
+    const avg = {
+      punctuality:   P/wsum,
+      respect:       R/wsum,
+      sportsmanship: S/wsum,
+      swearing:      W/wsum,
+      aggression:    A/wsum,
+    };
+
+    const n = (x:number)=> (x-1)/4;
+    const total = Math.round(100 * (
+      0.15*n(avg.punctuality) + 0.25*n(avg.respect) + 0.25*n(avg.sportsmanship) +
+      0.20*n(avg.swearing)    + 0.15*n(avg.aggression)
+    ));
+    const color = total >= 90 ? 'blue' : total >= 60 ? 'green' : total >= 40 ? 'yellow' : 'red';
+
+    return { avg, si: total, total, color, samples: rows.length };
+  }
+
+  // GET /users/:id/positions
+  @Get(':id/positions')
+  async positions(@Param('id') id: string) {
+    const rows = await this.prisma.positionRating.findMany({
+      where: { rateeId: id },
+      select: { pos: true, score: true, weight: true },
+      take: 5000,
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const byPos: Record<string, { avg: number; samples: number }> = {};
+    for (const r of rows) {
+      const p = r.pos;
+      const w = r.weight ?? 1;
+      if (!byPos[p]) byPos[p] = { avg: 0, samples: 0 };
+      byPos[p].avg += w * r.score;
+      byPos[p].samples += 1;
+      (byPos as any)[p].wsum = ((byPos as any)[p].wsum ?? 0) + w;
+    }
+    for (const p of Object.keys(byPos)) {
+      const wsum = (byPos as any)[p].wsum || 1;
+      byPos[p].avg = +(byPos[p].avg / wsum).toFixed(1);
+      delete (byPos as any)[p].wsum;
+    }
+    return { byPos };
+  }
+
+  /** Yakındaki oyuncular */
   @UseGuards(AuthGuard('jwt'))
   @Get('discover')
   async discover(
@@ -299,13 +432,11 @@ export class UsersController {
     @Query('lng') lngQ?: string,
     @Query('radiusKm') radiusQ?: string,
   ) {
-    const meId = req.user?.sub as string | undefined;
+    const meId = getUserId(req);
     if (!meId) throw new UnauthorizedException();
 
-    // yarıçap
     const radiusKm = Math.max(1, Math.min(200, Number(radiusQ) || 30));
 
-    // baz konum: query yoksa kullanıcının kendi konumu
     let baseLat = Number(latQ);
     let baseLng = Number(lngQ);
     if (!Number.isFinite(baseLat) || !Number.isFinite(baseLng)) {
@@ -318,7 +449,6 @@ export class UsersController {
       baseLng = me.lng!;
     }
 
-    // adaylar
     const candidates = await this.prisma.user.findMany({
       where: {
         discoverable: true,
@@ -326,17 +456,9 @@ export class UsersController {
         lat: { not: null },
         lng: { not: null },
       },
-      select: {
-        id: true,
-        phone: true,
-        level: true,
-        positions: true,
-        lat: true,
-        lng: true,
-      },
+      select: { id: true, phone: true, level: true, positions: true, lat: true, lng: true },
     });
 
-    // Haversine
     const toRad = (x: number) => (x * Math.PI) / 180;
     const haversineKm = (aLat: number, aLng: number, bLat: number, bLng: number) => {
       const R = 6371;

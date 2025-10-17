@@ -8,6 +8,9 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/**
+ * ---------------- Enums ----------------
+ */
 enum DominantFoot {
   L
   R
@@ -21,6 +24,21 @@ enum FriendRequestStatus {
   DECLINED
   CANCELLED
 }
+
+/**
+ * Davet statüsü
+ */
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+  EXPIRED
+}
+
+/**
+ * ---------------- Modeller ----------------
+ */
 
 model User {
   id                 String       @id @default(cuid())
@@ -40,6 +58,15 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // --- RATINGS ilişkileri (ekle) ---
+  ratingsGiven    Rating[]        @relation("Rater")
+  ratingsReceived Rating[]        @relation("Rated")
+  // Davranış rollup (opsiyonel cache)
+  behaviorRollup  BehaviorRollup?
+
+  posRatingsGiven    PositionRating[] @relation("PosRater")
+  posRatingsReceived PositionRating[] @relation("PosRated")
+
   // Friend request ilişkileri
   sentFriendRequests     FriendRequest[] @relation("FriendRequestFrom")
   receivedFriendRequests FriendRequest[] @relation("FriendRequestTo")
@@ -48,9 +75,13 @@ model User {
   userFriends Friendship[] @relation("UserFriends")
   friendsOf   Friendship[] @relation("UserFriendsOf")
 
-  // Mevcut ilişkilerin
-  Message Message[]
-  Match   Match[]
+  // Back-relations
+  Message Message[] // -> Message.user
+  Match   Match[] // -> Match.owner
+
+  // Davet back-relations
+  invitesSent     MatchInvite[] @relation("InviteFromUser")
+  invitesReceived MatchInvite[] @relation("InviteToUser")
 
   @@index([lat, lng])
 }
@@ -60,7 +91,7 @@ model FriendRequest {
   fromId    String
   toId      String
   status    FriendRequestStatus @default(PENDING)
-  message   String? // <— BUNU İSTİYORUZ
+  message   String?
   createdAt DateTime            @default(now())
   updatedAt DateTime            @updatedAt
 
@@ -87,15 +118,19 @@ model Friendship {
 }
 
 model Message {
-  id        String   @id @default(cuid())
-  matchId   String
-  userId    String
-  text      String
+  id      String @id @default(cuid())
+  matchId String
+  match   Match  @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  text    String
+
+  // --- yeni alanlar ---
+  deleted   Boolean   @default(false)
+  editedAt  DateTime?
+  updatedAt DateTime  @updatedAt
+
   createdAt DateTime @default(now())
-
-  user User @relation(fields: [userId], references: [id])
-
-  @@index([matchId, createdAt])
 }
 
 model Match {
@@ -110,6 +145,100 @@ model Match {
   ownerId  String?
   owner    User?    @relation(fields: [ownerId], references: [id])
 
+  // --- RATINGS ilişkisi (ekle) ---
+  ratings Rating[]
+
+  // back-relations
+  invites  MatchInvite[]
+  messages Message[] // <<< Message.match için karşı alan
+
+  posRatings PositionRating[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model MatchInvite {
+  id          String       @id @default(cuid())
+  matchId     String
+  fromUserId  String
+  toUserId    String?
+  toPhone     String?
+  message     String?
+  status      InviteStatus @default(PENDING)
+  expiresAt   DateTime?
+  respondedAt DateTime?
+  createdAt   DateTime     @default(now())
+
+  match    Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  fromUser User  @relation("InviteFromUser", fields: [fromUserId], references: [id])
+  toUser   User? @relation("InviteToUser", fields: [toUserId], references: [id])
+
+  @@index([matchId])
+  @@index([toUserId])
+  @@index([toPhone])
+}
+
+model Rating {
+  id      String @id @default(cuid())
+  matchId String
+  raterId String
+  ratedId String
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  rater User  @relation("Rater", fields: [raterId], references: [id], onDelete: Cascade)
+  rated User  @relation("Rated", fields: [ratedId], references: [id], onDelete: Cascade)
+
+  traits    Json
+  weight    Float     @default(1.0)
+  editCount Int       @default(1)
+  lockedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([matchId, raterId, ratedId])
+  @@index([ratedId])
+  @@index([raterId])
+  @@index([matchId])
+}
+
+//
+// İSTEĞE BAĞLI (performans cache’i). Şimdilik eklemek zorunda değilsin.
+// Eklemek istiyorsan bu modeli de yapıştır ve User’a başka bir şey eklemene gerek yok.
+//
+model BehaviorRollup {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  samples    Int      @default(0) // kaç örnek
+  punctual   Float    @default(0) // ağırlıklı toplamlar
+  respect    Float    @default(0)
+  sports     Float    @default(0)
+  swearing   Float    @default(0)
+  aggression Float    @default(0)
+  wsum       Float    @default(0) // ağırlık toplamı
+  si         Float    @default(0) // 0..100
+  updatedAt  DateTime @updatedAt
+}
+
+model PositionRating {
+  id        String   @id @default(cuid())
+  matchId   String
+  raterId   String
+  rateeId   String
+  pos       String   // 'GK','LB','CB', ...
+  score     Float    // 1..10
+  weight    Float    @default(1.0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // relations
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  rater User  @relation("PosRater", fields: [raterId], references: [id], onDelete: Cascade)
+  ratee User  @relation("PosRated", fields: [rateeId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, raterId, rateeId, pos])
+  @@index([rateeId, pos])
 }

@@ -1,11 +1,10 @@
+// src/matches/matches.controller.ts
 import {
   BadRequestException,
   Body,
   ConflictException,
   Controller,
   Get,
-  HttpException,
-  HttpStatus,
   NotFoundException,
   Param,
   Post,
@@ -14,28 +13,31 @@ import {
   UnauthorizedException,
   UseGuards,
 } from '@nestjs/common';
-import { Prisma, InviteStatus } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard'; // <<<
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
 import {
   buildInitialSlots,
   upgradeLegacySlots,
   normalizeSlots,
-  removeUser,
+  addReserves,
+  teamSizeFromFormat,
   Slot,
   Team,
 } from './slots';
 
-type InviteDtoCreate = {
-  toUserId?: string;
-  toPhone?: string;
-  message?: string;
-};
-type InviteDtoRespond = {
-  action: 'ACCEPT' | 'DECLINE' | 'CANCEL';
-};
+// Takım başına kaç yedek istiyorsun?
+// Takım başına SUB sayısı: 5v5–6v6 → 1, 7v7–9v9 → 2, 10v10–11v11 → 3
+function reservesPerTeamByFormat(fmt: string) {
+  const n = teamSizeFromFormat(fmt); // örn: "7v7" → 7
+  if (n <= 6) return 1;
+  if (n <= 9) return 2;
+  return 3;
+}
 
+
+/* -------------------- Yardımcılar -------------------- */
 function getUserIdFromReq(req: any): string | undefined {
   return req?.user?.id || req?.user?.sub || req?.user?.userId || undefined;
 }
@@ -52,10 +54,80 @@ async function canAccessMatch(
   });
   if (!m) return { ok: false, code: 'not_found' };
   if (m.ownerId === userId) return { ok: true };
+
   const slots = normalizeSlots(m.slots, m.format);
-  const isParticipant = slots.some((s) => s.userId === userId);
-  return isParticipant ? { ok: true } : { ok: false, code: 'forbidden' };
+  if (slots.some((s) => s.userId === userId)) return { ok: true };
+
+  // ACCEPTED daveti var mı? (delegate'e any ile eriş)
+  const hasAccepted = await ((prisma as any).matchInvite).findFirst({
+    where: { matchId, toUserId: userId, status: 'ACCEPTED' },
+    select: { id: true },
+  });
+  if (hasAccepted) return { ok: true };
+
+  return { ok: false, code: 'forbidden' };
 }
+
+// ---- Öneri endpoint’i için küçük yardımcılar ----
+type AvRange = { dow: number; start: string; end: string }; // 1=Mon ... 7=Sun
+function toDow(d: Date): number {
+  // JS: 0=Sun..6=Sat -> biz: 1=Mon..7=Sun
+  const js = d.getDay();
+  return js === 0 ? 7 : js;
+}
+function hhmm(d: Date): string {
+  const h = d.getHours().toString().padStart(2, '0');
+  const m = d.getMinutes().toString().padStart(2, '0');
+  return `${h}:${m}`;
+}
+function timeInRange(t: string, start: string, end: string) {
+  return t >= start && t <= end;
+}
+function haversineKm(aLat: number, aLng: number, bLat: number, bLng: number) {
+  const toRad = (x: number) => (x * Math.PI) / 180;
+  const R = 6371;
+  const dLat = toRad(bLat - aLat);
+  const dLng = toRad(bLng - aLng);
+  const sa =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(sa), Math.sqrt(1 - sa));
+  return R * c;
+}
+// DB’de availability iki formdan gelebilir: dizi ([{dow,start,end}]) veya eski map formu
+function normalizeAvailabilityAny(av: any): AvRange[] {
+  if (!av) return [];
+  if (Array.isArray(av)) {
+    return av
+      .map((x) => ({
+        dow: Number(x?.dow),
+        start: String(x?.start || ''),
+        end: String(x?.end || ''),
+      }))
+      .filter(
+        (x) =>
+          x.dow >= 1 &&
+          x.dow <= 7 &&
+          /^\d{2}:\d{2}$/.test(x.start) &&
+          /^\d{2}:\d{2}$/.test(x.end) &&
+          x.start < x.end,
+      );
+  }
+  const map: Record<string, number> = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
+  const out: AvRange[] = [];
+  for (const k of Object.keys(map)) {
+    const v = (av as any)[k];
+    if (!v?.enabled) continue;
+    const s = String(v.start || '');
+    const e = String(v.end || '');
+    if (/^\d{2}:\d{2}$/.test(s) && /^\d{2}:\d{2}$/.test(e) && s < e) {
+      out.push({ dow: map[k], start: s, end: e });
+    }
+  }
+  return out;
+}
+
+/* ===================================================== */
 
 @Controller('matches')
 export class MatchesController {
@@ -113,13 +185,15 @@ export class MatchesController {
   @UseGuards(JwtAuthGuard)
   async create(@Req() req: any, @Body() body: any) {
     const userId = getUserIdFromReq(req);
-    if (!userId) throw new HttpException('unauthorized', HttpStatus.UNAUTHORIZED);
-
-    const me = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
-    if (!me) throw new UnauthorizedException('reauth_required');
+    if (!userId) throw new UnauthorizedException();
 
     const fmt = (body?.format ?? '7v7') as string;
-    const initialSlots: Slot[] = buildInitialSlots(fmt, body?.positions);
+    const baseSlots: Slot[] = buildInitialSlots(fmt, body?.positions);
+    // SUB zaten varsa tekrar ekleme
+    const initialSlots = baseSlots.some(s => s.pos === 'SUB')
+      ? baseSlots
+      : addReserves(baseSlots, reservesPerTeamByFormat(fmt));
+
 
     const created = await this.prisma.match.create({
       data: {
@@ -156,12 +230,6 @@ export class MatchesController {
     @Req() req: any,
     @Body() body: { matchId: string; pos?: string; team?: Team; strict?: boolean },
   ) {
-    // >>> geçici debug – sorun devam ederse ENV ile aç-kapa
-    if (process.env.DEBUG_AUTH === '1') {
-      console.log('[JOIN] AUTH HDR =', req.headers?.authorization);
-      console.log('[JOIN] USER     =', req.user);
-    }
-
     const userId = getUserIdFromReq(req);
     if (!userId) throw new UnauthorizedException();
 
@@ -170,9 +238,19 @@ export class MatchesController {
 
     const slots: Slot[] = normalizeSlots((match as any).slots, (match as any).format);
 
+    // Tüm slotlar doluysa net mesaj
+    if (slots.every((s) => !!s.userId)) {
+      throw new ConflictException('match_full');
+    }
+
     // Zaten katıldıysa
     const mine = slots.find((s) => s.userId === userId);
     if (mine) return { ok: true, pos: mine.pos };
+
+    // Double-check (yarış şartları için)
+    const nowSlots: Slot[] = normalizeSlots(match.slots as any, match.format as any);
+    const anyOpen = nowSlots.some((s) => !s.userId);
+    if (!anyOpen) throw new ConflictException('match_full');
 
     // Pozisyon geldiyse
     let desired = body.pos?.trim().toUpperCase();
@@ -183,7 +261,7 @@ export class MatchesController {
       if (!ok) throw new ConflictException('slot already taken');
     }
 
-    // Gelmediyse: tercihlerden oto
+    // Gelmediyse: tercihlerden oto (+SUB fallback)
     if (!desired) {
       const me = await this.prisma.user.findUnique({
         where: { id: userId },
@@ -199,7 +277,21 @@ export class MatchesController {
       );
 
       desired = prefs.find((p) => open.has(p));
-      if (!desired) throw new ConflictException('no preferred open slot'); // 409
+      if (!desired) {
+        // takım tercihi varsa önce o takımın SUB’ı
+        const subOnPreferredTeam = slots.find(
+          (s) => !s.userId && s.pos === 'SUB' && (!body.team || s.team === body.team),
+        );
+        if (subOnPreferredTeam) {
+          desired = 'SUB';
+        } else {
+          // herhangi SUB?
+          const anySub = slots.find((s) => !s.userId && s.pos === 'SUB');
+          if (anySub) desired = 'SUB';
+        }
+      }
+
+      if (!desired) throw new ConflictException('no preferred open slot');
     }
 
     // Atomik güncelle
@@ -236,10 +328,10 @@ export class MatchesController {
     @Body() body: {
       title?: string | null;
       location?: string | null;
-      level?: string | null;       // "Kolay" | "Orta" | "Zor" (serbest string de olur)
-      format?: string | null;      // "5v5" | "7v7" | "8v8" | "11v11"
+      level?: string | null;
+      format?: string | null;
       price?: number | null;
-      time?: string | null;        // ISO veya datetime-local string (parse edeceğiz)
+      time?: string | null;
     },
   ) {
     const userId = getUserIdFromReq(req);
@@ -252,15 +344,14 @@ export class MatchesController {
     if (!current) throw new NotFoundException('match not found');
     if (current.ownerId !== userId) throw new UnauthorizedException('not_owner');
 
-    // Gönderilen alanları nazikçe normalize et
     const data: any = {};
     const normStr = (v: any) =>
       typeof v === 'string' ? (v.trim() === '' ? null : v.trim()) : v ?? null;
 
-    if ('title' in body)    data.title    = normStr(body.title);
+    if ('title' in body) data.title = normStr(body.title);
     if ('location' in body) data.location = normStr(body.location);
-    if ('level' in body)    data.level    = normStr(body.level);
-    if ('price' in body)    data.price    = body.price === null ? null : Number(body.price);
+    if ('level' in body) data.level = normStr(body.level);
+    if ('price' in body) data.price = body.price === null ? null : Number(body.price);
 
     if ('time' in body) {
       if (!body.time) data.time = null;
@@ -274,22 +365,23 @@ export class MatchesController {
     if ('format' in body) {
       const nextFmt = normStr(body.format);
       if (nextFmt && nextFmt !== current.format) {
-        // Güvenli yaklaşım: format değişimi, biri katılmışsa kilitli
-        const anyJoined = normalizeSlots(current.slots, current.format).some(s => !!s.userId);
-        if (anyJoined) {
-          throw new ConflictException('format_locked'); // UI’da uyarı göster
-        }
+        const anyJoined = normalizeSlots(current.slots, current.format).some((s) => !!s.userId);
+        if (anyJoined) throw new ConflictException('format_locked');
+
+        // format değişiyorsa slotları da yeni kurala göre yeniden üret
+        const baseSlots = buildInitialSlots(nextFmt, undefined);
+        const withSubs = baseSlots.some(s => s.pos === 'SUB')
+          ? baseSlots
+          : addReserves(baseSlots, reservesPerTeamByFormat(nextFmt));
         data.format = nextFmt;
-        // Not: Var olan slotları koruduk; istersen burada buildInitialSlots ile yeniden kurabilirsin.
+        data.slots  = withSubs as unknown as Prisma.JsonArray;
       }
     }
-
-    await this.prisma.match.update({ where: { id }, data, select: { id: true }});
+    await this.prisma.match.update({ where: { id }, data, select: { id: true } });
     return { ok: true };
   }
 
-
-  /* -------------------- AYRIL (REST: /matches/:id/leave) -------------------- */
+  /* -------------------- AYRIL -------------------- */
   @Post(':id/leave')
   @UseGuards(JwtAuthGuard)
   async leaveRest(@Req() req: any, @Param('id') matchId: string) {
@@ -339,17 +431,52 @@ export class MatchesController {
   @Post('upgrade-slots')
   @UseGuards(JwtAuthGuard)
   async upgradeAll() {
-    const all = await this.prisma.match.findMany({ select: { id: true, format: true, slots: true } });
+    const all = await this.prisma.match.findMany({
+      select: { id: true, format: true, slots: true },
+    });
+
     let updated = 0;
+
     for (const m of all) {
-      const upgraded = upgradeLegacySlots(m.slots, m.format);
-      if (Array.isArray(m.slots) && (m.slots as any[])[0]?.team) continue;
+      const current = normalizeSlots(m.slots, m.format);
+      const per = reservesPerTeamByFormat(m.format);
+
+      let target = [...current];
+
+      const adjustTeam = (team: Team) => {
+        const starters = target.filter((s) => s.team === team && s.pos !== 'SUB');
+        const bench    = target.filter((s) => s.team === team && s.pos === 'SUB');
+
+        const assigned = bench.filter((s) => !!s.userId);
+        const empty    = bench.filter((s) => !s.userId);
+
+        // fazlaları (boş olanlardan başlayarak) buda
+        while (assigned.length + empty.length > per && empty.length > 0) {
+          empty.pop();
+        }
+        // eksikse boş SUB ekle
+        while (assigned.length + empty.length < per) {
+          empty.push({ team, pos: 'SUB', userId: null } as any);
+        }
+
+        return [...starters, ...assigned, ...empty];
+      };
+
+      const nextA = adjustTeam('A');
+      const nextB = adjustTeam('B');
+
+      target = [...nextA.filter(s => s.team === 'A'), ...nextB.filter(s => s.team === 'B')];
+
+      const changed = JSON.stringify(target) !== JSON.stringify(current);
+      if (!changed) continue;
+
       await this.prisma.match.update({
         where: { id: m.id },
-        data: { slots: upgraded as unknown as Prisma.JsonArray },
+        data: { slots: target as unknown as Prisma.JsonArray },
       });
       updated++;
     }
+
     return { ok: true, updated };
   }
 
@@ -378,15 +505,6 @@ export class MatchesController {
       orderBy: { createdAt: 'desc' },
       take,
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-      select: {
-        id: true,
-        userId: true,
-        text: true,
-        deleted: true,
-        createdAt: true,
-        updatedAt: true,
-        editedAt: true,
-      },
     });
 
     return { items: messages.reverse() };
@@ -413,15 +531,6 @@ export class MatchesController {
 
     const msg = await this.prisma.message.create({
       data: { matchId, userId, text },
-      select: {
-        id: true,
-        userId: true,
-        text: true,
-        deleted: true,
-        createdAt: true,
-        updatedAt: true,
-        editedAt: true,
-      },
     });
 
     return { ok: true, message: msg };
@@ -453,16 +562,7 @@ export class MatchesController {
 
     const updated = await this.prisma.message.update({
       where: { id: msgId },
-      data: { text, editedAt: new Date() },
-      select: {
-        id: true,
-        userId: true,
-        text: true,
-        deleted: true,
-        createdAt: true,
-        updatedAt: true,
-        editedAt: true,
-      },
+      data: ({ text, editedAt: new Date() } as any),
     });
 
     return { ok: true, message: updated };
@@ -490,216 +590,194 @@ export class MatchesController {
 
     const updated = await this.prisma.message.update({
       where: { id: msgId },
-      data: { deleted: true, text: '' },
-      select: {
-        id: true,
-        userId: true,
-        text: true,
-        deleted: true,
-        createdAt: true,
-        updatedAt: true,
-        editedAt: true,
-      },
+      data: ({ deleted: true, text: '' } as any),
     });
 
     return { ok: true, message: updated };
   }
 
-  /* ================== INVITES ================== */
+  /* ===================== ÖNERİLEN DAVETLER ===================== */
   @UseGuards(JwtAuthGuard)
-  @Get(':id/invites')
-  async listInvites(@Req() req: any, @Param('id') matchId: string) {
-    const userId = getUserIdFromReq(req);
-    if (!userId) throw new UnauthorizedException();
-
-    const access = await canAccessMatch(this.prisma, matchId, userId);
-    if (!access.ok) {
-      if (access.code === 'not_found') throw new NotFoundException('match not found');
-      throw new UnauthorizedException();
-    }
-
-    const rows = await this.prisma.invite.findMany({
-      where: { matchId },
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        matchId: true,
-        status: true,
-        message: true,
-        createdAt: true,
-        updatedAt: true,
-        from: { select: { id: true, phone: true } },
-        to: { select: { id: true, phone: true } },
-      },
-    });
-
-    return { items: rows };
-  }
-
-  @UseGuards(JwtAuthGuard)
-  @Post(':id/invites')
-  async createInvite(
+  @Get(':id/recommend-invites')
+  async recommendInvites(
     @Req() req: any,
     @Param('id') matchId: string,
-    @Body() body: InviteDtoCreate,
+    @Query('radiusKm') radiusQ?: string,
+    @Query('limit') limitQ?: string,
   ) {
     const userId = getUserIdFromReq(req);
     if (!userId) throw new UnauthorizedException();
 
+    // Maçı ve boş pozisyonları çek
+    const match = await this.prisma.match.findUnique({
+      where: { id: matchId },
+      select: { id: true, ownerId: true, time: true, format: true, slots: true },
+    });
+    if (!match) throw new NotFoundException('match not found');
+
+    // erişim: sahibi/katılımcı/accepted davet
     const access = await canAccessMatch(this.prisma, matchId, userId);
-    if (!access.ok) {
-      if (access.code === 'not_found') throw new NotFoundException('match not found');
-      throw new UnauthorizedException();
-    }
+    if (!access.ok) throw new UnauthorizedException();
 
-    let toUser: { id: string } | null = null;
-    if (body.toUserId) {
-      toUser = await this.prisma.user.findUnique({ where: { id: body.toUserId }, select: { id: true } });
-    } else if ((body.toPhone ?? '').trim()) {
-      const digits = String(body.toPhone).replace(/\D/g, '');
-      const cand = [
-        digits,
-        digits.startsWith('0') ? digits.slice(1) : `0${digits}`,
-        digits.startsWith('90') ? digits.slice(2) : `90${digits}`,
-        digits.startsWith('90') ? `0${digits.slice(2)}` : undefined,
-        digits.startsWith('905') ? digits.slice(2) : undefined,
-        digits.startsWith('905') ? `0${digits.slice(2)}` : undefined,
-      ].filter(Boolean) as string[];
-      toUser = await this.prisma.user.findFirst({ where: { phone: { in: cand } }, select: { id: true } });
-    }
+    const slots = normalizeSlots(match.slots, match.format);
+    // slots'tan sonra (boş pozisyonları vs. çıkardıktan hemen sonra)
+    const participants: Set<string> = new Set(
+      slots
+        .filter((s): s is Slot & { userId: string } => typeof s.userId === 'string' && s.userId.length > 0)
+        .map((s) => s.userId)
+    );
 
-    if (!toUser) throw new BadRequestException('recipient not found');
-    if (toUser.id === userId) throw new BadRequestException('cannot invite yourself');
+    const openCore = slots.filter((s) => !s.userId && s.pos !== 'SUB').map((s) => s.pos);
+    const hasSubHoleA = slots.some((s) => s.team === 'A' && s.pos === 'SUB' && !s.userId);
+    const hasSubHoleB = slots.some((s) => s.team === 'B' && s.pos === 'SUB' && !s.userId);
 
-    const existing = await this.prisma.invite.findFirst({
+    // Önceden davet edilen (pending/accepted) kullanıcıları ele
+    const recentInvs = await ((this.prisma as any).matchInvite).findMany({
+      where: { matchId, status: { in: ['PENDING', 'ACCEPTED'] }, toUserId: { not: null } },
+      select: { toUserId: true },
+    });
+    // recentInvs sonrası
+    const invited: Set<string> = new Set(
+      (recentInvs as Array<{ toUserId: string | null }>)
+        .map((x) => x.toUserId)
+        .filter((x): x is string => !!x)
+    );
+
+    // arayanın konumu
+    const me = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { lat: true, lng: true },
+    });
+    const baseLat = Number(me?.lat);
+    const baseLng = Number(me?.lng);
+    const hasBase = Number.isFinite(baseLat) && Number.isFinite(baseLng);
+
+    const radiusKm = Math.max(1, Math.min(Number(radiusQ) || 30, 200));
+    const limit = Math.max(1, Math.min(Number(limitQ) || 20, 100));
+
+    // Arkadaşlar (puan bonusu)
+    const friends = await this.prisma.friendship.findMany({
       where: {
-        matchId,
-        fromId: userId,
-        toId: toUser.id,
-        status: { in: [InviteStatus.PENDING, InviteStatus.ACCEPTED] },
+        OR: [
+          { userId, friendId: { not: userId } },
+          { friendId: userId, userId: { not: userId } },
+        ],
       },
-      select: { id: true, status: true },
+      select: { userId: true, friendId: true },
     });
-    if (existing) throw new ConflictException(`already ${existing.status.toLowerCase()}`);
-
-    const created = await this.prisma.invite.create({
-      data: {
-        matchId,
-        fromId: userId,
-        toId: toUser.id,
-        message: body.message?.trim() || null,
+    const friendIds = new Set<string>();
+    for (const f of friends) {
+      if (f.userId === userId) friendIds.add(f.friendId);
+      if (f.friendId === userId) friendIds.add(f.userId);
+    }
+    const notInIds: string[] = [
+      userId!,                              // burada zaten üstte auth check var
+      ...Array.from(participants),
+      ...Array.from(invited),
+    ];
+    // adaylar
+    const candidates = await this.prisma.user.findMany({
+      where: {
+        discoverable: true,
+        id: { notIn: notInIds },
+        lat: { not: null },
+        lng: { not: null },
       },
       select: {
         id: true,
-        status: true,
-        message: true,
-        createdAt: true,
-        from: { select: { id: true, phone: true } },
-        to: { select: { id: true, phone: true } },
+        phone: true,
+        level: true,
+        positions: true,
+        availability: true,
+        lat: true,
+        lng: true,
       },
     });
 
-    return { ok: true, invite: created };
-  }
+    // maç zamanı -> dow & HH:MM
+    const matchTime = match.time ? new Date(match.time) : null;
+    const matchDow = matchTime ? toDow(matchTime) : null;
+    const matchT = matchTime ? hhmm(matchTime) : null;
 
-  @UseGuards(JwtAuthGuard)
-  @Post('invites/:inviteId/respond')
-  async respondInvite(
-    @Req() req: any,
-    @Param('inviteId') inviteId: string,
-    @Body() body: InviteDtoRespond,
-  ) {
-    const userId = getUserIdFromReq(req);
-    if (!userId) throw new UnauthorizedException();
+    const scored = candidates
+      .map((u) => {
+        const posArr = Array.isArray(u.positions) ? (u.positions as any[]).map(String) : [];
+        const avRanges = normalizeAvailabilityAny(u.availability);
 
-    const inv = await this.prisma.invite.findUnique({
-      where: { id: inviteId },
-      select: { id: true, matchId: true, fromId: true, toId: true, status: true },
-    });
-    if (!inv) throw new NotFoundException('invite not found');
+        // Pozisyon skoru
+        let posScore = 0;
+        const tags: string[] = [];
+        if (openCore.length && posArr.length) {
+          const hit = posArr.find((p) => openCore.includes(p));
+          if (hit) {
+            posScore = 3;
+            tags.push(`poz:${hit}`);
+          }
+        } else if ((hasSubHoleA || hasSubHoleB) && posArr.length) {
+          posScore = 1; // çekirdek dolu ama yedek boş olabilir
+          tags.push('yedek-uyum');
+        }
 
-    if (body.action === 'ACCEPT' || body.action === 'DECLINE') {
-      if (inv.toId !== userId) throw new UnauthorizedException();
-    } else if (body.action === 'CANCEL') {
-      if (inv.fromId !== userId) throw new UnauthorizedException();
-    } else {
-      throw new BadRequestException('invalid action');
-    }
+        // Availability skoru
+        let availScore = 0;
+        if (matchDow && matchT && avRanges.length) {
+          const ok = avRanges.some((r) => r.dow === matchDow && timeInRange(matchT, r.start, r.end));
+          if (ok) {
+            availScore = 2;
+            tags.push('müsait');
+          }
+        }
 
-    if (inv.status !== InviteStatus.PENDING) throw new ConflictException('already processed');
+        // Mesafe skoru
+        let distanceKm = Number.NaN;
+        let distScore = 0;
+        if (hasBase && u.lat != null && u.lng != null) {
+          distanceKm = haversineKm(baseLat, baseLng, Number(u.lat), Number(u.lng));
+          if (distanceKm <= radiusKm) {
+            distScore = distanceKm <= 5 ? 2 : distanceKm <= 15 ? 1 : 0;
+            if (distScore > 0) tags.push(`~${distanceKm.toFixed(1)}km`);
+          }
+        }
 
-    const status: InviteStatus =
-      body.action === 'ACCEPT'
-        ? InviteStatus.ACCEPTED
-        : body.action === 'DECLINE'
-        ? InviteStatus.DECLINED
-        : InviteStatus.CANCELLED;
+        // Arkadaş bonusu
+        const isFriend = friendIds.has(u.id);
+        const friendScore = isFriend ? 2 : 0;
+        if (isFriend) tags.push('arkadaş');
 
-    const updated = await this.prisma.invite.update({
-      where: { id: inviteId },
-      data: { status },
-      select: { id: true, status: true, matchId: true },
-    });
+        // (İLERİ: sportsmanship alanlarını schema’ya ekleyince burada −/＋ puanlayacağız)
 
-    return { ok: true, invite: updated };
-  }
+        const score = posScore + availScore + distScore + friendScore;
 
-  /* ================== INBOX / OUTBOX ================== */
-  @UseGuards(JwtAuthGuard)
-  @Get('invites/inbox')
-  async listMyIncomingInvites(@Req() req: any, @Query('status') status?: string) {
-    const userId = getUserIdFromReq(req);
-    if (!userId) throw new UnauthorizedException();
+        return {
+          id: u.id,
+          phone: u.phone,
+          level: u.level,
+          positions: posArr,
+          distanceKm,
+          isFriend,
+          score,
+          tags,
+        };
+      })
+      .filter((x) => {
+        if (hasBase) return Number.isFinite(x.distanceKm) && x.distanceKm <= radiusKm;
+        return true;
+      })
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        if (Number.isFinite(a.distanceKm) && Number.isFinite(b.distanceKm)) {
+          if (a.distanceKm !== b.distanceKm) return a.distanceKm - b.distanceKm;
+        }
+        return (b.level ?? 0) - (a.level ?? 0);
+      })
+      .slice(0, limit);
 
-    const where: any = { toId: userId };
-    if (status) {
-      const s = String(status).toUpperCase();
-      if (['PENDING', 'ACCEPTED', 'DECLINED', 'CANCELLED'].includes(s)) where.status = s;
-    }
-
-    const rows = await this.prisma.invite.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        status: true,
-        message: true,
-        createdAt: true,
-        updatedAt: true,
-        from: { select: { id: true, phone: true } },
-        match: { select: { id: true, title: true, time: true, location: true, format: true, level: true } },
-      },
-    });
-
-    return { items: rows };
-  }
-
-  @UseGuards(JwtAuthGuard)
-  @Get('invites/sent')
-  async listMySentInvites(@Req() req: any, @Query('status') status?: string) {
-    const userId = getUserIdFromReq(req);
-    if (!userId) throw new UnauthorizedException();
-
-    const where: any = { fromId: userId };
-    if (status) {
-      const s = String(status).toUpperCase();
-      if (['PENDING', 'ACCEPTED', 'DECLINED', 'CANCELLED'].includes(s)) where.status = s;
-    }
-
-    const rows = await this.prisma.invite.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        status: true,
-        message: true,
-        createdAt: true,
-        updatedAt: true,
-        to: { select: { id: true, phone: true } },
-        match: { select: { id: true, title: true, time: true, location: true, format: true, level: true } },
-      },
-    });
-
-    return { items: rows };
+    return {
+      ok: true,
+      openPositions: Array.from(new Set(openCore)),
+      canSubA: hasSubHoleA,
+      canSubB: hasSubHoleB,
+      items: scored,
+    };
   }
 }
