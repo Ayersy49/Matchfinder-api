@@ -12,6 +12,10 @@ import {
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
+import { ForbiddenException, ConflictException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+import { normalizeSlots, Slot } from '../matches/slots';
+
 
 /* ---------------- Types / Helpers ---------------- */
 
@@ -178,7 +182,7 @@ export class RatingsController {
   @UseGuards(JwtAuthGuard)
   @Get('pending')
   async pending(@Req() req: any) {
-    const me = req?.user?.sub || req?.user?.id;
+    const me = req?.user?.id || req?.user?.sub || req?.user?.userId;
     if (!me) throw new UnauthorizedException();
 
     const now = new Date();
@@ -305,70 +309,6 @@ export class RatingsController {
     return { ok: true };
   }
 
-  /* ---------------- Tekil SUBMIT (sadece davranış) ---------------- */
-  @UseGuards(JwtAuthGuard)
-  @Post(':matchId/submit')
-  async submit(
-    @Req() req: any,
-    @Param('matchId') matchId: string,
-    @Body() body: { rateeId: string; metrics: MetricsIn }
-  ) {
-    const raterId = req?.user?.sub || req?.user?.id;
-    if (!raterId) throw new UnauthorizedException();
-
-    const ratedId = String(body?.rateeId || '');
-    const traits = this.toTraitsJSON(body?.metrics || {});
-    if (!ratedId) throw new BadRequestException('invalid');
-    if (ratedId === raterId) throw new BadRequestException('self_rate');
-
-    const match = await this.prisma.match.findUnique({
-      where: { id: matchId },
-      select: { time: true, slots: true },
-    });
-    if (!match) throw new NotFoundException('match');
-
-    const slots = this.slotsOf(match);
-    const playedRater = slots.some((s) => s.userId === raterId);
-    const playedRated = slots.some((s) => s.userId === ratedId);
-    if (!playedRater || !playedRated) throw new UnauthorizedException('not_participant');
-
-    const tooLate =
-      match.time && Date.now() - new Date(match.time).getTime() > 24 * 3600 * 1000;
-    if (tooLate) throw new BadRequestException('window_closed');
-
-    const friend = await this.isFriend(raterId, ratedId);
-    const together = await this.togetherCount(raterId, ratedId);
-    const weight =
-      this.weightRel(friend, together) * this.weightTime(match.time ?? null);
-
-    const existing = await this.prisma.rating.findUnique({
-      where: { matchId_raterId_ratedId: { matchId, raterId, ratedId } },
-      select: { id: true },
-    });
-
-    if (existing) {
-      await this.prisma.rating.update({
-        where: { id: existing.id },
-        data: { traits, weight, editCount: { increment: 1 } },
-      });
-    } else {
-      await this.prisma.rating.create({
-        data: { matchId, raterId, ratedId, traits, weight, editCount: 1 },
-      });
-    }
-
-    // Dönen özet
-    const rows = await this.prisma.rating.findMany({
-      where: { ratedId },
-      select: { traits: true, weight: true },
-    });
-    const { avg } = this.computeWeightedAvg(rows);
-    const total = this.score100(avg);
-    const color = this.colorForTotal(total);
-
-    return { ok: true, total, color, avg };
-  }
-
   /* ---------------- SUMMARY ---------------- */
   @Get('/user/:id/summary')
   async summary(@Param('id') ratedId: string) {
@@ -382,5 +322,116 @@ export class RatingsController {
     const total = this.score100(avg);
     const color = this.colorForTotal(total);
     return { count: rows.length, total, color, avg };
+  }
+
+  /** FE: tek ekranda toplu submit
+ *  POST /ratings/:matchId/submit
+ *  Body: { items: [{ rateeId, pos, posScore(1..10), traits: {punctuality,respect,sports,swearing,aggression} }, ...] }
+ */
+  @Post(':matchId/submit')
+  @UseGuards(JwtAuthGuard)
+  async submit(
+    @Req() req: any,
+    @Param('matchId') matchId: string,
+    @Body() body: {
+      items?: Array<{
+        rateeId: string;
+        pos?: string;
+        posScore?: number;
+        traits?: Partial<{
+          punctuality: number;
+          respect: number;
+          sports: number;
+          swearing: number;
+          aggression: number;
+        }>;
+      }>;
+    },
+  ) {
+    const raterId = req?.user?.id || req?.user?.sub || req?.user?.userId;
+    if (!raterId) throw new UnauthorizedException();
+
+    const match = await this.prisma.match.findUnique({ where: { id: matchId } });
+    if (!match) throw new NotFoundException('match_not_found');
+
+    // 24 saatlik rating penceresi
+    const t = match.time ? new Date(match.time) : null;
+    const windowOk = t ? Date.now() <= t.getTime() + 24 * 60 * 60 * 1000 : true;
+    if (!windowOk) throw new ForbiddenException('window_closed');
+
+    const slots: Slot[] = normalizeSlots(match.slots, match.format);
+    const participants = new Set(slots.map((s) => s.userId).filter((x): x is string => !!x));
+
+    // Rater maçta olmalı
+    if (!participants.has(raterId)) throw new ForbiddenException('not_participant');
+
+    const items = Array.isArray(body?.items) ? body!.items : [];
+    if (!items.length) throw new BadRequestException('items_required');
+
+    // küçük yardımcılar
+    const s5 = (x: any) => {
+      const n = Number(x);
+      if (!Number.isFinite(n) || n < 1 || n > 5) throw new BadRequestException('invalid_trait');
+      return n;
+    };
+    const s10 = (x: any) => {
+      const n = Number(x);
+      if (!Number.isFinite(n) || n < 1 || n > 10) throw new BadRequestException('invalid_posScore');
+      return n;
+    };
+
+    await this.prisma.$transaction(async (tx) => {
+      for (const it of items) {
+        const rateeId = String(it.rateeId || '');
+        if (!rateeId || rateeId === raterId) continue; // kendini rate etme
+        if (!participants.has(rateeId)) continue;       // maçta olmayanı es geç
+
+        // Pozisyon puanı (1–10)
+        if (it.posScore != null) {
+          const played = slots.find((s) => s.userId === rateeId);
+          // yanlış pos gelse bile oynadığı varsa onu baz al + STP→CB normalize et
+          const posKey = mapPos(played?.pos || it.pos || 'SUB').toUpperCase();
+
+          await tx.positionRating.upsert({
+            where: { matchId_raterId_rateeId_pos: { matchId, raterId, rateeId, pos: posKey } },
+            create: { matchId, raterId, rateeId, pos: posKey, score: s10(it.posScore), weight: 1.0 },
+            update: { score: s10(it.posScore), weight: 1.0, updatedAt: new Date() },
+          }); 
+        }
+
+
+        // Davranış puanları (1–5)
+        if (it.traits && Object.keys(it.traits).length) {
+          const traits = {
+            punctuality: s5(it.traits.punctuality ?? 3),
+            respect:     s5(it.traits.respect     ?? 3),
+            sports:      s5(it.traits.sports      ?? 3),
+            swearing:    s5(it.traits.swearing    ?? 3),
+            aggression:  s5(it.traits.aggression  ?? 3),
+        } ;
+
+          // rate-limit: aynı rater->ratee için max 3 edit
+          const ex = await tx.rating.findUnique({
+            where: { matchId_raterId_ratedId: { matchId, raterId, ratedId: rateeId } },
+          });
+          if (!ex) {
+            await tx.rating.create({
+              data: {
+                matchId, raterId, ratedId: rateeId,
+                traits: traits as unknown as Prisma.JsonObject,
+                weight: 1.0, editCount: 1,
+              },
+            });
+          } else {
+            if (ex.editCount >= 3) throw new ConflictException('rate_limit');
+            await tx.rating.update({
+              where: { id: ex.id },
+              data: { traits: traits as unknown as Prisma.JsonObject, editCount: { increment: 1 } },
+            });
+          }
+        }
+      }
+    });
+    return { ok: true };
   }
 }

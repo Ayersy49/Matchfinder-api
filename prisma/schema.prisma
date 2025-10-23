@@ -25,9 +25,6 @@ enum FriendRequestStatus {
   CANCELLED
 }
 
-/**
- * Davet statüsü
- */
 enum InviteStatus {
   PENDING
   ACCEPTED
@@ -35,6 +32,19 @@ enum InviteStatus {
   CANCELLED
   EXPIRED
 }
+
+enum AccessStatus {
+  PENDING
+  APPROVED
+  DECLINED
+}
+
+enum MatchStatus {
+  DRAFT
+  OPEN
+  CLOSED
+}
+
 
 /**
  * ---------------- Modeller ----------------
@@ -50,7 +60,7 @@ model User {
   preferredFormation String?
   level              Int          @default(5)
 
-  // keşif için
+  // keşif
   lat          Float?
   lng          Float?
   discoverable Boolean @default(false)
@@ -58,20 +68,19 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // --- RATINGS ilişkileri (ekle) ---
-  ratingsGiven    Rating[]        @relation("Rater")
-  ratingsReceived Rating[]        @relation("Rated")
-  // Davranış rollup (opsiyonel cache)
-  behaviorRollup  BehaviorRollup?
+  // Ratings
+  ratingsGiven    Rating[] @relation("Rater")
+  ratingsReceived Rating[] @relation("Rated")
+
+  behaviorRollup BehaviorRollup?
 
   posRatingsGiven    PositionRating[] @relation("PosRater")
   posRatingsReceived PositionRating[] @relation("PosRated")
 
-  // Friend request ilişkileri
+  // Arkadaşlık
   sentFriendRequests     FriendRequest[] @relation("FriendRequestFrom")
   receivedFriendRequests FriendRequest[] @relation("FriendRequestTo")
 
-  // Friendship ilişkileri
   userFriends Friendship[] @relation("UserFriends")
   friendsOf   Friendship[] @relation("UserFriendsOf")
 
@@ -79,9 +88,12 @@ model User {
   Message Message[] // -> Message.user
   Match   Match[] // -> Match.owner
 
-  // Davet back-relations
+  // Davetler
   invitesSent     MatchInvite[] @relation("InviteFromUser")
   invitesReceived MatchInvite[] @relation("InviteToUser")
+
+  // Erişim isteği: bu kullanıcının açtıkları
+  accessRequestsSent MatchAccessRequest[] @relation("AccessRequestsFromUser")
 
   @@index([lat, lng])
 }
@@ -125,12 +137,29 @@ model Message {
   user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   text    String
 
-  // --- yeni alanlar ---
   deleted   Boolean   @default(false)
   editedAt  DateTime?
   updatedAt DateTime  @updatedAt
 
   createdAt DateTime @default(now())
+}
+
+model MatchAccessRequest {
+  id          String       @id @default(cuid())
+  matchId     String
+  requesterId String
+  status      AccessStatus @default(PENDING)
+  message     String?
+  createdAt   DateTime     @default(now())
+  respondedAt DateTime?
+
+  // Karşı alanlarla relation isimlerini eşleştir
+  match     Match @relation("MatchAccessRequests", fields: [matchId], references: [id], onDelete: Cascade)
+  requester User  @relation("AccessRequestsFromUser", fields: [requesterId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, requesterId], map: "uniq_access_req")
+  @@index([matchId])
+  @@index([requesterId])
 }
 
 model Match {
@@ -145,14 +174,20 @@ model Match {
   ownerId  String?
   owner    User?    @relation(fields: [ownerId], references: [id])
 
-  // --- RATINGS ilişkisi (ekle) ---
+  status    MatchStatus  @default(OPEN)   
+  closedAt  DateTime?                    
+
   ratings Rating[]
 
-  // back-relations
-  invites  MatchInvite[]
-  messages Message[] // <<< Message.match için karşı alan
+  inviteOnly Boolean @default(false)
 
+  // back-relations
+  invites    MatchInvite[]
+  messages   Message[]
   posRatings PositionRating[]
+
+  // Erişim istekleri (karşı: MatchAccessRequest.match)
+  accessRequests MatchAccessRequest[] @relation("MatchAccessRequests")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -203,42 +238,51 @@ model Rating {
   @@index([matchId])
 }
 
-//
-// İSTEĞE BAĞLI (performans cache’i). Şimdilik eklemek zorunda değilsin.
-// Eklemek istiyorsan bu modeli de yapıştır ve User’a başka bir şey eklemene gerek yok.
-//
 model BehaviorRollup {
   userId String @id
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  samples    Int      @default(0) // kaç örnek
-  punctual   Float    @default(0) // ağırlıklı toplamlar
+  samples    Int      @default(0)
+  punctual   Float    @default(0)
   respect    Float    @default(0)
   sports     Float    @default(0)
   swearing   Float    @default(0)
   aggression Float    @default(0)
-  wsum       Float    @default(0) // ağırlık toplamı
-  si         Float    @default(0) // 0..100
+  wsum       Float    @default(0)
+  si         Float    @default(0)
   updatedAt  DateTime @updatedAt
 }
 
 model PositionRating {
-  id        String   @id @default(cuid())
-  matchId   String
-  raterId   String
-  rateeId   String
-  pos       String   // 'GK','LB','CB', ...
-  score     Float    // 1..10
-  weight    Float    @default(1.0)
+  id      String @id @default(cuid())
+  matchId String
+  raterId String
+  rateeId String
+  pos     String // 'GK','LB','CB',...
+  score   Float // 1..10
+  weight  Float  @default(1.0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // relations
   match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
   rater User  @relation("PosRater", fields: [raterId], references: [id], onDelete: Cascade)
   ratee User  @relation("PosRated", fields: [rateeId], references: [id], onDelete: Cascade)
 
   @@unique([matchId, raterId, rateeId, pos])
   @@index([rateeId, pos])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String   // 'access_approved' | 'rating_reminder' | ...
+  matchId   String?
+  data      Json?
+  createdAt DateTime @default(now())
+  readAt    DateTime?
+
+  @@index([userId, readAt])
+  @@index([userId, type])
+  @@unique([userId, type, matchId]) // aynı kullanıcı+tip+maç için tekrarı engelle
 }

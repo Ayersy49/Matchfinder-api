@@ -12,6 +12,8 @@ import { MessagesModule } from './messages/messages.module';
 import { FriendsModule } from './friends/friends.module';
 import { InvitesModule } from './invites/invites.module';
 import { RatingsModule } from './ratings/ratings.module';
+import { NotificationsModule } from './notifications/notifications.module';
+
 
 
 @Module({
@@ -51,6 +53,7 @@ import { RatingsModule } from './ratings/ratings.module';
     FriendsModule,
     InvitesModule,
     RatingsModule,
+    NotificationsModule,
   ],
 })
 export class AppModule {}
