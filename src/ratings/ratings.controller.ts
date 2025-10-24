@@ -9,38 +9,41 @@ import {
   Req,
   UnauthorizedException,
   UseGuards,
+  ForbiddenException,
+  ConflictException,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
-import { ForbiddenException, ConflictException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { normalizeSlots, Slot } from '../matches/slots';
-
 
 /* ---------------- Types / Helpers ---------------- */
 
 type MetricsIn = {
-  punctual?: number;      // 1..5
+  // alias’lar destekleniyor (punctuality/sports/profanity vb.)
+  punctual?: number;
   respect?: number;
-  sportsman?: number;     // FE alternatif anahtar
-  sportsmanship?: number; // FE alternatif anahtar
-  profanity?: number;     // FE alternatif anahtar
-  swearing?: number;      // FE alternatif anahtar
+  sportsman?: number;
+  sportsmanship?: number;
+  sports?: number;
+  profanity?: number;
+  swearing?: number;
   aggression?: number;
 };
 
-// Bulk body: tek satır
 type RateItem = {
   rateeId: string;
   traits?: MetricsIn;
-  pos?: string;         // ör: 'ST','CB' ...
-  posScore?: number;    // 1..10
+  pos?: string;
+  posScore?: number; // 1..10
 };
 
 const HALF_LIFE_DAYS = 180;
 const TOGETHER_HALFLIFE = 5;
 
 const mapPos = (p?: string | null) => (p === 'STP' ? 'CB' : (p || ''));
+
+
 
 @Controller('ratings')
 export class RatingsController {
@@ -64,14 +67,15 @@ export class RatingsController {
     return 'red';
   }
 
+  /** FE farklı anahtarlarla gönderebilir; normalize et ve 1..5 aralığını doğrula */
   private toTraitsJSON(input?: MetricsIn) {
-    const src = input || {};
-    // FE farklı anahtarlarla gönderebilir; normalize et
+    const src = (input || {}) as any;
     const get = (v: unknown) => (typeof v === 'number' ? v : undefined);
 
-    const punctuality = get(src.punctual);
+    // alias destekleri
+    const punctuality = get(src.punctuality ?? src.punctual);
     const respect = get(src.respect);
-    const sportsmanship = get(src.sportsmanship ?? src.sportsman);
+    const sportsmanship = get(src.sportsmanship ?? src.sportsman ?? src.sports);
     const swearing = get(src.swearing ?? src.profanity);
     const aggression = get(src.aggression);
 
@@ -188,11 +192,8 @@ export class RatingsController {
     const now = new Date();
     const since = new Date(now.getTime() - 24 * 3600 * 1000);
 
-    // Son 24 saatte oynadığım maçlar
     const matches = await this.prisma.match.findMany({
-      where: {
-        time: { gte: since, lte: now } as any,
-      },
+      where: { time: { gte: since, lte: now } as any },
       select: { id: true, title: true, time: true, slots: true },
       orderBy: { time: 'desc' },
       take: 20,
@@ -231,13 +232,34 @@ export class RatingsController {
     return { items };
   }
 
+  /* ---------------- REMAINING (bu maçta benim kalan düzenleme haklarım) ---------------- */
+  @UseGuards(JwtAuthGuard)
+  @Get(':matchId/remaining')
+  async remaining(@Req() req: any, @Param('matchId') matchId: string) {
+    const raterId = req?.user?.id || req?.user?.sub || req?.user?.userId;
+    if (!raterId) throw new UnauthorizedException();
+
+    const rows = await this.prisma.rating.findMany({
+      where: { matchId, raterId },
+      select: { ratedId: true, editCount: true },
+    });
+
+    const remaining: Record<string, number> = {};
+    for (const r of rows) {
+      remaining[r.ratedId] = Math.max(0, 3 - (r.editCount ?? 0));
+    }
+    // hiç kaydı olmayan ratee için 3 varsayacağız (FE tarafında)
+    return { remaining };
+  }
+
+
   /* ---------------- BULK (davranış + mevki performansı) ---------------- */
   @UseGuards(JwtAuthGuard)
   @Post(':matchId/bulk')
   async bulk(
     @Req() req: any,
     @Param('matchId') matchId: string,
-    @Body() body: { items: RateItem[] }
+    @Body() body: { items: RateItem[] },
   ) {
     const raterId = req?.user?.sub || req?.user?.id;
     if (!raterId) throw new UnauthorizedException();
@@ -258,56 +280,76 @@ export class RatingsController {
       match.time && Date.now() - new Date(match.time).getTime() > 24 * 3600 * 1000;
     if (tooLate) throw new BadRequestException('window_closed');
 
+    const remainingMap: Record<string, number> = {};
+    const lockedSet = new Set<string>();
+
     for (const it of body.items) {
       const ratedId = String(it?.rateeId || '');
       if (!ratedId || ratedId === raterId) continue;
 
+      // mevcut kayıt (kilit kontrolü için her zaman çek)
+      const ex = await this.prisma.rating.findUnique({
+        where: { matchId_raterId_ratedId: { matchId, raterId, ratedId } },
+        select: { id: true, editCount: true },
+      });
+
+      if (ex?.editCount != null && ex.editCount >= 3) {
+        remainingMap[ratedId] = 0;
+        lockedSet.add(ratedId);
+        continue; // bu oyuncuyu TAMAMEN atla (traits + pos)
+      }
+
       const friend = await this.isFriend(raterId, ratedId);
       const together = await this.togetherCount(raterId, ratedId);
-      const weight = this.weightRel(friend, together) * this.weightTime(match.time ?? null);
+      const weight =
+        this.weightRel(friend, together) * this.weightTime(match.time ?? null);
 
-      // Davranış (1..5) — opsiyonel: varsa yazarız
+      // Davranış
       if (it.traits) {
         const traits = this.toTraitsJSON(it.traits);
-        const existing = await this.prisma.rating.findUnique({
-          where: { matchId_raterId_ratedId: { matchId, raterId, ratedId } },
-          select: { id: true },
-        });
-        if (existing) {
+
+        if (ex) {
           await this.prisma.rating.update({
-            where: { id: existing.id },
+            where: { id: ex.id },
             data: { traits, weight, editCount: { increment: 1 } },
           });
+          remainingMap[ratedId] = Math.max(0, 3 - (ex.editCount + 1));
         } else {
           await this.prisma.rating.create({
             data: { matchId, raterId, ratedId, traits, weight, editCount: 1 },
           });
+          remainingMap[ratedId] = 2; // 3’ten 1 kullandı
         }
       }
 
-      // Mevki performansı (1..10) — opsiyonel: varsa yazarız
+      // Mevki performansı
       const posScore = Number(it?.posScore);
       if (Number.isFinite(posScore) && posScore >= 1 && posScore <= 10) {
-        // pos gelmemişse slotlardan bul
         let pos =
-          it?.pos ||
-          slots.find((s) => s.userId === ratedId)?.pos ||
-          undefined;
+          it?.pos || slots.find((s) => s.userId === ratedId)?.pos || undefined;
         pos = mapPos(pos);
         if (pos) {
           await this.prisma.positionRating.upsert({
             where: {
-              matchId_raterId_rateeId_pos: { matchId, raterId, rateeId: ratedId, pos },
+              matchId_raterId_rateeId_pos: {
+                matchId,
+                raterId,
+                rateeId: ratedId,
+                pos,
+              },
             },
             update: { score: posScore, weight, updatedAt: new Date() },
             create: { matchId, raterId, rateeId: ratedId, pos, score: posScore, weight },
           });
         }
       }
+
+      // traits hiç yoksa ve ex de yoksa, remainingMap’e dokunma (FE 3 varsayacak)
     }
 
-    return { ok: true };
+    return { ok: true, remaining: remainingMap, locked: Array.from(lockedSet) };
   }
+
 
   /* ---------------- SUMMARY ---------------- */
   @Get('/user/:id/summary')
@@ -325,26 +367,21 @@ export class RatingsController {
   }
 
   /** FE: tek ekranda toplu submit
- *  POST /ratings/:matchId/submit
- *  Body: { items: [{ rateeId, pos, posScore(1..10), traits: {punctuality,respect,sports,swearing,aggression} }, ...] }
- */
+   *  POST /ratings/:matchId/submit
+   *  Body: { items: [{ rateeId, pos, posScore(1..10), traits: {...} }, ...] }
+   */
   @Post(':matchId/submit')
   @UseGuards(JwtAuthGuard)
   async submit(
     @Req() req: any,
     @Param('matchId') matchId: string,
-    @Body() body: {
+    @Body()
+    body: {
       items?: Array<{
         rateeId: string;
         pos?: string;
         posScore?: number;
-        traits?: Partial<{
-          punctuality: number;
-          respect: number;
-          sports: number;
-          swearing: number;
-          aggression: number;
-        }>;
+        traits?: MetricsIn;
       }>;
     },
   ) {
@@ -360,78 +397,90 @@ export class RatingsController {
     if (!windowOk) throw new ForbiddenException('window_closed');
 
     const slots: Slot[] = normalizeSlots(match.slots, match.format);
-    const participants = new Set(slots.map((s) => s.userId).filter((x): x is string => !!x));
+    const participants = new Set(
+      slots.map((s) => s.userId).filter((x): x is string => !!x),
+    );
 
-    // Rater maçta olmalı
     if (!participants.has(raterId)) throw new ForbiddenException('not_participant');
 
     const items = Array.isArray(body?.items) ? body!.items : [];
     if (!items.length) throw new BadRequestException('items_required');
 
-    // küçük yardımcılar
-    const s5 = (x: any) => {
-      const n = Number(x);
-      if (!Number.isFinite(n) || n < 1 || n > 5) throw new BadRequestException('invalid_trait');
-      return n;
-    };
     const s10 = (x: any) => {
       const n = Number(x);
-      if (!Number.isFinite(n) || n < 1 || n > 10) throw new BadRequestException('invalid_posScore');
+      if (!Number.isFinite(n) || n < 1 || n > 10)
+        throw new BadRequestException('invalid_posScore');
       return n;
     };
+
+    const remainingMap: Record<string, number> = {};
 
     await this.prisma.$transaction(async (tx) => {
       for (const it of items) {
         const rateeId = String(it.rateeId || '');
-        if (!rateeId || rateeId === raterId) continue; // kendini rate etme
-        if (!participants.has(rateeId)) continue;       // maçta olmayanı es geç
+        if (!rateeId || rateeId === raterId) continue;
+        if (!participants.has(rateeId)) continue;
 
-        // Pozisyon puanı (1–10)
+        // mevcut kayıt (lock kontrolü)
+        const ex = await tx.rating.findUnique({
+          where: { matchId_raterId_ratedId: { matchId, raterId, ratedId: rateeId } },
+          select: { id: true, editCount: true },
+        });
+
+        if (ex?.editCount != null && ex.editCount >= 3) {
+          remainingMap[rateeId] = 0;
+          continue; // kilitliyse hem traits hem pos atla
+        }
+
+        // ağırlıklar
+        const friend = await this.isFriend(raterId, rateeId);
+        const together = await this.togetherCount(raterId, rateeId);
+        const weight =
+          this.weightRel(friend, together) * this.weightTime(match.time ?? null);
+
+        // Pozisyon (1–10)
         if (it.posScore != null) {
           const played = slots.find((s) => s.userId === rateeId);
-          // yanlış pos gelse bile oynadığı varsa onu baz al + STP→CB normalize et
           const posKey = mapPos(played?.pos || it.pos || 'SUB').toUpperCase();
 
           await tx.positionRating.upsert({
             where: { matchId_raterId_rateeId_pos: { matchId, raterId, rateeId, pos: posKey } },
-            create: { matchId, raterId, rateeId, pos: posKey, score: s10(it.posScore), weight: 1.0 },
-            update: { score: s10(it.posScore), weight: 1.0, updatedAt: new Date() },
-          }); 
+            create: { matchId, raterId, rateeId, pos: posKey, score: s10(it.posScore), weight },
+            update: { score: s10(it.posScore), weight, updatedAt: new Date() },
+          });
         }
 
-
-        // Davranış puanları (1–5)
+        // Davranış (1–5)
         if (it.traits && Object.keys(it.traits).length) {
-          const traits = {
-            punctuality: s5(it.traits.punctuality ?? 3),
-            respect:     s5(it.traits.respect     ?? 3),
-            sports:      s5(it.traits.sports      ?? 3),
-            swearing:    s5(it.traits.swearing    ?? 3),
-            aggression:  s5(it.traits.aggression  ?? 3),
-        } ;
+          const traits = this.toTraitsJSON(it.traits as any);
 
-          // rate-limit: aynı rater->ratee için max 3 edit
-          const ex = await tx.rating.findUnique({
-            where: { matchId_raterId_ratedId: { matchId, raterId, ratedId: rateeId } },
-          });
           if (!ex) {
             await tx.rating.create({
               data: {
-                matchId, raterId, ratedId: rateeId,
+                matchId,
+                raterId,
+                ratedId: rateeId,
                 traits: traits as unknown as Prisma.JsonObject,
-                weight: 1.0, editCount: 1,
+                weight,
+                editCount: 1,
               },
             });
+            remainingMap[rateeId] = 2;
           } else {
-            if (ex.editCount >= 3) throw new ConflictException('rate_limit');
-            await tx.rating.update({
+            const updated = await tx.rating.update({
               where: { id: ex.id },
-              data: { traits: traits as unknown as Prisma.JsonObject, editCount: { increment: 1 } },
+              data: {
+                traits: traits as unknown as Prisma.JsonObject,
+                weight,
+                editCount: { increment: 1 },
+              },
+              select: { editCount: true },
             });
+            remainingMap[rateeId] = Math.max(0, 3 - updated.editCount);
           }
         }
       }
     });
-    return { ok: true };
+    return { ok: true, remaining: remainingMap };
   }
 }

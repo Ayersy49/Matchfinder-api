@@ -45,7 +45,6 @@ enum MatchStatus {
   CLOSED
 }
 
-
 /**
  * ---------------- Modeller ----------------
  */
@@ -94,6 +93,14 @@ model User {
 
   // Erişim isteği: bu kullanıcının açtıkları
   accessRequestsSent MatchAccessRequest[] @relation("AccessRequestsFromUser")
+
+  // -------- Seri (tekrarlayan maç) ilişkileri (YENİ) --------
+  seriesOwned              MatchSeries[] // -> MatchSeries.owner
+  seriesMemberships        SeriesMember[] // -> SeriesMember.user
+  seriesMembershipRequests SeriesMembershipRequest[] // -> SeriesMembershipRequest.requester
+
+  // Haftalık yoklama (RSVP) (YENİ)
+  attendances MatchAttendance[] // -> MatchAttendance.user
 
   @@index([lat, lng])
 }
@@ -173,9 +180,14 @@ model Match {
   slots    Json     @default("[]")
   ownerId  String?
   owner    User?    @relation(fields: [ownerId], references: [id])
+  listed   Boolean  @default(false)
 
-  status    MatchStatus  @default(OPEN)   
-  closedAt  DateTime?                    
+  // Seri ile ilişki (YENİ)
+  seriesId String?
+  series   MatchSeries? @relation(fields: [seriesId], references: [id])
+
+  status   MatchStatus @default(OPEN)
+  closedAt DateTime?
 
   ratings Rating[]
 
@@ -189,8 +201,13 @@ model Match {
   // Erişim istekleri (karşı: MatchAccessRequest.match)
   accessRequests MatchAccessRequest[] @relation("MatchAccessRequests")
 
+  // Haftalık yoklama (RSVP) back-relation (YENİ)
+  attendances MatchAttendance[] // -> MatchAttendance.match
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([seriesId])
 }
 
 model MatchInvite {
@@ -274,15 +291,91 @@ model PositionRating {
 }
 
 model Notification {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   userId    String
-  type      String   // 'access_approved' | 'rating_reminder' | ...
+  type      String // 'access_approved' | 'rating_reminder' | ...
   matchId   String?
   data      Json?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
   readAt    DateTime?
 
+  @@unique([userId, type, matchId]) // aynı kullanıcı+tip+maç için tekrarı engelle
   @@index([userId, readAt])
   @@index([userId, type])
-  @@unique([userId, type, matchId]) // aynı kullanıcı+tip+maç için tekrarı engelle
+}
+
+/**
+ * ==================== SERİ (TEKRARLAYAN) – YENİ ====================
+ */
+
+model MatchSeries {
+  id              String    @id @default(cuid())
+  ownerId         String
+  title           String
+  location        String?
+  format          String    @default("7v7")
+  price           Int?
+  dayOfWeek       Int // 1..7 (Mon..Sun) (Pazar=7)
+  timeHHmm        String // "10:00"
+  tz              String    @default("Europe/Istanbul")
+  startDate       DateTime
+  endDate         DateTime?
+  inviteOnly      Boolean   @default(true)
+  reservesPerTeam Int       @default(2)
+
+  // ilişkiler
+  owner    User                      @relation(fields: [ownerId], references: [id])
+  members  SeriesMember[]
+  matches  Match[]
+  requests SeriesMembershipRequest[] // <- back relation eklendi
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SeriesMember {
+  id        String   @id @default(cuid())
+  seriesId  String
+  userId    String
+  pos       String // "GK","LB",... (sabit mevki)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  series MatchSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  user   User        @relation(fields: [userId], references: [id])
+
+  @@unique([seriesId, userId])
+  @@index([userId])
+}
+
+model SeriesMembershipRequest {
+  id          String       @id @default(cuid())
+  seriesId    String
+  requesterId String
+  status      AccessStatus @default(PENDING)
+  message     String?
+  createdAt   DateTime     @default(now())
+  respondedAt DateTime?
+
+  series    MatchSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  requester User        @relation(fields: [requesterId], references: [id])
+
+  @@unique([seriesId, requesterId])
+  @@index([seriesId])
+  @@index([requesterId])
+}
+
+model MatchAttendance {
+  id        String   @id @default(cuid())
+  matchId   String
+  userId    String
+  status    String // 'GOING' | 'NOT_GOING'
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id])
+
+  @@unique([matchId, userId])
+  @@index([userId])
 }

@@ -13,6 +13,8 @@ import { FriendsModule } from './friends/friends.module';
 import { InvitesModule } from './invites/invites.module';
 import { RatingsModule } from './ratings/ratings.module';
 import { NotificationsModule } from './notifications/notifications.module';
+import { SeriesModule } from './series/series.module';
+
 
 
 
@@ -54,6 +56,7 @@ import { NotificationsModule } from './notifications/notifications.module';
     InvitesModule,
     RatingsModule,
     NotificationsModule,
+    SeriesModule,
   ],
 })
 export class AppModule {}

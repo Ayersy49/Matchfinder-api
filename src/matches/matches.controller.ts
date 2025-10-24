@@ -15,7 +15,7 @@ import {
   ForbiddenException,
   Res,
 } from '@nestjs/common';
-import { Response } from 'express';
+import { Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -31,6 +31,7 @@ import {
   reserveSlot,
   releaseReserved,
 } from './slots';
+import { tr } from 'zod/v4/locales';
 
 // Takım başına SUB sayısı: 5v5–6v6 → 1, 7v7–9v9 → 2, 10v10–11v11 → 3
 function reservesPerTeamByFormat(fmt: string) {
@@ -98,7 +99,16 @@ export class MatchesController {
   async list(@Req() req: any, @Query() _q: any) {
     const meId: string | null = getUserIdFromReq(req) ?? null;
 
+    // --- GENEL LİSTE: sadece yayınlanmışlar
+    const where: any = { listed: true };
+
+    // Admin hepsini görmek isterse (?includeHidden=1)
+    if (req.user?.role === 'ADMIN' && String(_q?.includeHidden) === '1') {
+      delete where.listed;
+    }
+
     let items = await this.prisma.match.findMany({
+      where,
       orderBy: [{ time: 'asc' as const }, { createdAt: 'desc' as const }],
       select: {
         id: true,
@@ -114,10 +124,33 @@ export class MatchesController {
         inviteOnly: true,
         status: true,
         closedAt: true,
+        listed: true,
+        seriesId: true,
       },
     });
 
-    // user yoksa sadece normalize edilmiş slotları ve statusEffective'i döndür
+    // 🔽 Her seriden sadece en yakın "gelecekteki" maçı bırak
+    const now = new Date();
+    const hidePast = String(_q?.hidePast || '') === '1'; // UI'daki "Geçmişi gizle" için
+    const seenSeries = new Set<string>();
+
+    items = items.filter((m) => {
+      const isPast = m.time ? new Date(m.time as any) < now : false;
+
+      // "Geçmişi gizle" tikliyse tekil maçlar için de gizle
+      if (hidePast && isPast) return false;
+
+      // Seri maçıysa: geçmişi listeleme; gelecekteyse her seriden yalnızca ilkini göster
+      if (m.seriesId) {
+        if (isPast) return false;                  // seride geçtiyse listede görünmesin
+        if (seenSeries.has(m.seriesId)) return false; // aynı seriden ikincileri at
+        seenSeries.add(m.seriesId);
+      }
+
+      return true;
+    });
+
+    // user yoksa normalize edip dön
     if (!meId) {
       return items.map((m) => ({
         ...m,
@@ -128,7 +161,10 @@ export class MatchesController {
 
     const matchIds = items.map((m) => m.id);
 
-    // Bu kullanıcının listedeki maçlar için PENDING/APPROVED istekleri
+    // erişim/owner/join bilgileri (değişmedi)
+    // ... items'i çektikten sonra (orderBy/select kısmı değişmiyor)
+
+    // erişim/owner/join bilgileri
     const reqs = await this.prisma.matchAccessRequest.findMany({
       where: {
         requesterId: meId,
@@ -137,14 +173,16 @@ export class MatchesController {
       },
       select: { matchId: true, status: true },
     });
-    const approvedSet = new Set(reqs.filter((r) => r.status === 'APPROVED').map((r) => r.matchId));
-    const pendingSet = new Set(reqs.filter((r) => r.status === 'PENDING').map((r) => r.matchId));
+    const approvedSet = new Set(reqs.filter(r => r.status === 'APPROVED').map(r => r.matchId));
+    const pendingSet  = new Set(reqs.filter(r => r.status === 'PENDING' ).map(r => r.matchId));
 
-    return items.map((m) => {
-      const slots = normalizeSlots(m.slots, m.format);
-      const owner = m.ownerId === meId;
+    /* 1) ÖNCE normalize et ama return ETME */
+    const normalized = items.map((m) => {
+      const slots  = normalizeSlots(m.slots, m.format);
+      const owner  = m.ownerId === meId;
       const joined = slots.some((s) => s.userId === meId);
       const canView = !m.inviteOnly || owner || joined || approvedSet.has(m.id);
+
       return {
         ...m,
         statusEffective: effectiveStatus(m),
@@ -157,6 +195,31 @@ export class MatchesController {
         },
       };
     });
+
+    /* 2) Üyelikleri tek sorguda çek (mevcut kullanıcı için) */
+    const seriesIds = Array.from(
+      new Set(
+        normalized.map(m => m.seriesId).filter(Boolean) as string[]
+      )
+    );
+
+    let memberSet = new Set<string>();
+    if (meId && seriesIds.length) {
+      const memberships = await (this.prisma as any).seriesMember.findMany({
+        where: { seriesId: { in: seriesIds }, userId: meId, active: true },
+        select: { seriesId: true },
+      });
+      memberSet = new Set(memberships.map((x: any) => x.seriesId)); 
+    }
+
+    /* 3) TEK bir return: access içine isSeriesMember ekle */
+    return normalized.map(m => ({
+      ...m,
+      access: {
+        ...m.access,
+        isSeriesMember: Boolean(m.seriesId && memberSet.has(m.seriesId as string)),
+      },
+    }));
   }
 
   /* -------------------- DETAY -------------------- */
@@ -376,6 +439,14 @@ export class MatchesController {
       });
     });
 
+    // Onaylandıysa istek sahibine bildirim bırak (idempotent)
+    if (nextStatus === 'APPROVED') {
+      try {
+        await this.prisma.notification.create({
+          data: { userId: r.requesterId, type: 'access_approved', matchId, data: { matchId } },
+        });
+        } catch (e: any) { if (e?.code !== 'P2002') console.error(e); }
+      }
     return { ok: true };
   }
 
@@ -389,6 +460,8 @@ export class MatchesController {
     const fmt = (body?.format ?? '7v7') as string;
     const baseSlots: Slot[] = buildInitialSlots(fmt, body?.positions, reservesPerTeamByFormat(fmt));
     const initialSlots = baseSlots;
+    const listedFinal = body?.seriesId ? (body?.listed ?? false) : (body?.listed ?? true);
+
 
     const created = await this.prisma.match.create({
       data: {
@@ -403,6 +476,8 @@ export class MatchesController {
         inviteOnly: !!body?.inviteOnly,
         status: (body?.status as any) || 'OPEN',
         closedAt: null,
+        seriesId: body?.seriesId ?? null,
+        listed: listedFinal,
       },
       select: {
         id: true,
@@ -418,11 +493,43 @@ export class MatchesController {
         inviteOnly: true,
         status: true,
         closedAt: true,
+        listed: true,
+        seriesId: true,
       },
     });
 
     return { ...created, slots: initialSlots, statusEffective: effectiveStatus(created) };
   }
+
+
+
+  /* -------------------- YAYINLA -------------------- */
+
+  @UseGuards(JwtAuthGuard)
+  @Post(':id/publish')
+  async publish(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body('listed') listed: boolean | string,
+  ) {
+    const userId = getUserIdFromReq(req);
+    if (!userId) throw new UnauthorizedException();
+
+    const m = await this.prisma.match.findUnique({
+      where: { id },
+      select: { ownerId: true },
+    });
+    if (!m) throw new NotFoundException('match_not_found');
+    if (m.ownerId !== userId && req.user?.role !== 'ADMIN') {
+      throw new ForbiddenException('only_owner');
+    }
+
+    const isListed = listed === true || listed === 'true' || listed === '1';
+    await this.prisma.match.update({ where: { id }, data: { listed: isListed } });
+    return { ok: true, listed: isListed };
+  }
+
+
 
   /* -------------------- KATIL -------------------- */
   @Post('join')
@@ -627,7 +734,15 @@ export class MatchesController {
     if (!userId) throw new UnauthorizedException();
 
     const m = await this.prisma.match.findUnique({ where: { id: matchId } });
+    // --- DURUM GUARDI: kapalı/taslak maçta rezerv işlemi yok ---
+    const eff = effectiveStatus(m as any);
+    if (eff === 'CLOSED') throw new ForbiddenException('match_closed');
+    if ((m as any).status === 'DRAFT') throw new ForbiddenException('draft');
+
     if (!m) throw new NotFoundException('match not found');
+    if (effectiveStatus(m) === 'CLOSED') {
+      throw new ForbiddenException('match_closed');
+    }
 
     const isOwner = (m as any).ownerId === userId;
     if (body.type === 'ADMIN' && !isOwner) throw new ForbiddenException('only_owner');
@@ -658,7 +773,14 @@ export class MatchesController {
     if (!userId) throw new UnauthorizedException();
 
     const m = await this.prisma.match.findUnique({ where: { id: matchId } });
+    const eff = effectiveStatus(m as any);
+    if (eff === 'CLOSED') throw new ForbiddenException('match_closed');
+    if ((m as any).status === 'DRAFT') throw new ForbiddenException('draft');
+
     if (!m) throw new NotFoundException('match not found');
+    if (effectiveStatus(m) === 'CLOSED') {
+      throw new ForbiddenException('match_closed');
+    }
 
     const isOwner = (m as any).ownerId === userId;
 
@@ -712,6 +834,123 @@ export class MatchesController {
     });
 
     return { ok: true };
+  }
+    /* -------------------- RSVP (Geliyorum/Gelmeyeceğim) -------------------- */
+  @Post(':id/rsvp')
+  @UseGuards(JwtAuthGuard)
+  async rsvp(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() b: { status: 'GOING' | 'NOT_GOING' },
+  ) {
+    const meId = req.user?.id || req.user?.sub;
+    if (!meId) throw new UnauthorizedException();
+
+    const m = await this.prisma.match.findUnique({
+      where: { id },
+      select: { id: true, seriesId: true, ownerId: true, slots: true, format: true },
+    });
+    if (!m) throw new NotFoundException('match_not_found');
+
+    // Seri maçıysa: owner veya aktif seri üyesi şartı
+    if (m.seriesId) {
+      const isOwner = m.ownerId === meId;
+
+      const isMember = !!(await this.prisma.seriesMember.findFirst({
+        where: { seriesId: m.seriesId, userId: meId, active: true },
+        select: { userId: true },
+      }));
+
+      // (Opsiyonel) Maça katılmış oyuncu da RSVP yapabilsin dersen:
+      // const joined = Array.isArray(m.slots)
+      //   ? normalizeSlots(m.slots as any, m.format as any).some((s: any) => s.userId === meId)
+      //   : false;
+
+      if (!isOwner && !isMember /* && !joined */) {
+        throw new ForbiddenException('not_series_member');
+      }
+    }
+
+    // Buradan sonrası: RSVP kaydetme (uygulamandaki mevcut mantığı kullan)
+    await this.prisma.matchAttendance.upsert({
+      where: { matchId_userId: { matchId: id, userId: meId } },
+      create: { matchId: id, userId: meId, status: b.status },
+      update: { status: b.status },
+    });
+
+    return { ok: true };
+  }
+
+    /* -------------------- Bu haftayı iptal et (admin) -------------------- */
+  @Post(':id/cancel-week')
+  @UseGuards(JwtAuthGuard)
+  async cancelWeek(@Req() req:any, @Param('id') matchId: string) {
+    const userId = getUserIdFromReq(req);
+    if (!userId) throw new UnauthorizedException();
+    const m = await this.prisma.match.findUnique({
+      where: { id: matchId },
+      select: { id:true, ownerId:true, status:true, seriesId:true },
+    });
+    if (!m) throw new NotFoundException('match_not_found');
+    if (m.ownerId !== userId) throw new ForbiddenException('only_owner');
+
+    await this.prisma.match.update({ where: { id: matchId }, data: { status: 'CLOSED', closedAt: new Date() } });
+
+    // Seriye aitse tüm sabit üyelere bildirim
+    if (m.seriesId) {
+      const members = await (this.prisma as any).seriesMember.findMany({
+        where: { seriesId: m.seriesId, active: true }, select: { userId: true },
+      });
+      for (const u of members) {
+        try {
+          await (this.prisma as any).notification.create({
+            data: { userId: u.userId, type: 'series_week_canceled', matchId, data: { matchId } },
+          });
+        } catch (e:any) { /* unique ihlali vs. sessiz */ }
+      }
+    }
+    return { ok: true };
+  }
+
+
+  
+  /* ===================== ICS: Takvime Ekle ===================== */
+  @Get(':id/ics')
+  @UseGuards(JwtAuthGuard)
+  async ics(@Param('id') id: string, @Res() res: Response) {
+    const m = await this.prisma.match.findUnique({
+      where: { id },
+      select: { id: true, title: true, location: true, time: true },
+    });
+    if (!m) throw new NotFoundException('not_found');
+
+    const start = m.time ? new Date(m.time) : new Date();
+    const end = addMinutes(start, 90); // varsayılan 90dk
+    const uid = `match-${m.id}@matchfinder`;
+    const now = new Date();
+
+    const ics = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//MatchFinder//EN',
+      'CALSCALE:GREGORIAN',
+      'METHOD:PUBLISH',
+      'BEGIN:VEVENT',
+      `UID:${icsEscape(uid)}`,
+      `DTSTAMP:${dtStamp(now)}`,
+      `DTSTART:${dtStamp(start)}`,
+      `DTEND:${dtStamp(end)}`,
+      `SUMMARY:${icsEscape(m.title || 'Maç')}`,
+      m.location ? `LOCATION:${icsEscape(m.location)}` : '',
+      'END:VEVENT',
+      'END:VCALENDAR',
+    ]
+      .filter(Boolean)
+      .join('\r\n');
+
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="match-${m.id}.ics"`);
+    return res.send(ics);
   }
 
   /* -------------------- ESKİ MAÇ TEMİZLEME -------------------- */
@@ -1106,44 +1345,7 @@ export class MatchesController {
     };
   }
 
-  /* ===================== ICS: Takvime Ekle ===================== */
-  @Get(':id/ics')
-  @UseGuards(JwtAuthGuard)
-  async ics(@Param('id') id: string, @Res() res: Response) {
-    const m = await this.prisma.match.findUnique({
-      where: { id },
-      select: { id: true, title: true, location: true, time: true },
-    });
-    if (!m) throw new NotFoundException('not_found');
-
-    const start = m.time ? new Date(m.time) : new Date();
-    const end = addMinutes(start, 90); // varsayılan 90dk
-    const uid = `match-${m.id}@matchfinder`;
-    const now = new Date();
-
-    const ics = [
-      'BEGIN:VCALENDAR',
-      'VERSION:2.0',
-      'PRODID:-//MatchFinder//EN',
-      'CALSCALE:GREGORIAN',
-      'METHOD:PUBLISH',
-      'BEGIN:VEVENT',
-      `UID:${icsEscape(uid)}`,
-      `DTSTAMP:${dtStamp(now)}`,
-      `DTSTART:${dtStamp(start)}`,
-      `DTEND:${dtStamp(end)}`,
-      `SUMMARY:${icsEscape(m.title || 'Maç')}`,
-      m.location ? `LOCATION:${icsEscape(m.location)}` : '',
-      'END:VEVENT',
-      'END:VCALENDAR',
-    ]
-      .filter(Boolean)
-      .join('\r\n');
-
-    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="match-${m.id}.ics"`);
-    return res.send(ics);
-  }
+  
 }
 
 /* -------------------- erişim kontrolü (helper) -------------------- */
@@ -1156,6 +1358,8 @@ async function canAccessMatch(
     where: { id: matchId },
     select: { id: true, ownerId: true, slots: true, format: true },
   });
+
+
   if (!m) return { ok: false, code: 'not_found' };
   if (m.ownerId === userId) return { ok: true };
 

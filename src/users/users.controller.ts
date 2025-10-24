@@ -159,6 +159,33 @@ export class UsersController {
         ? (user.positionLevels as Record<string, number>)
         : {};
     const safeAvail = coerceFromDb(user.availability);
+    // --- dış değerlendirme almış mevkiler (kilitlenecekler) ---
+    const prGrouped = await this.prisma.positionRating.groupBy({
+      by: ['pos'],
+      where: { rateeId: user.id },
+      _count: { _all: true },
+    });
+    const posLocked: string[] = prGrouped
+      .filter(x => Number((x as any)?._count?._all || 0) > 0)
+      .map(x => String(x.pos).toUpperCase());
+
+    // --- pozisyon seviyelerini UPPERCASE key'lere normalize et ---
+    const upperLevels: Record<string, number> = {};
+    for (const [k, v] of Object.entries(safeLevels)) {
+      upperLevels[String(k).toUpperCase()] = Number(v as any);
+    }
+
+    // --- ilk 3 tercih (profildeki positions dizisinin ilk 3'ü) ---
+    const top3: string[] = Array.isArray(user.positions)
+      ? (user.positions as any[]).map(String).slice(0, 3).map(p => p.toUpperCase())
+      : [];
+
+    // --- ilk 3 mevki + kullanıcı kendi verdiği seviye (yoksa genel seviye) ---
+    const top3WithLevels = top3.map(p => ({
+      pos: p,
+      level: Number(upperLevels[p] ?? user.level ?? 5),
+    }));
+
 
     return {
       id: user.id,
@@ -166,7 +193,7 @@ export class UsersController {
       dominantFoot: (user.dominantFoot as any) ?? 'N',
       positions: safePositions,
       preferredFormation: (user.preferredFormation as any) ?? '4-2-3-1',
-      positionLevels: safeLevels,
+      positionLevels: upperLevels,
       availability: safeAvail,
       level: user.level ?? 5,
       lat: user.lat ?? null,
@@ -174,6 +201,9 @@ export class UsersController {
       discoverable: !!user.discoverable,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
+      posLocked,
+      topPositions: top3,
+      top3WithLevels,
     };
   }
 
@@ -200,14 +230,33 @@ export class UsersController {
     }
 
     if (dto?.positionLevels && typeof dto.positionLevels === 'object') {
+      // 1) kullanıcının dışarıdan oylama almış (kilitli) mevkilerini çek
+      const grouped = await this.prisma.positionRating.groupBy({
+        by: ['pos'],
+        where: { rateeId: id },
+        _count: { _all: true },
+      });
+      const locked = new Set(
+        grouped
+          .filter(g => Number((g as any)?._count?._all || 0) > 0)
+          .map(g => String(g.pos).toUpperCase())
+      );
+
       const allowed = new Set(ALLOWED_POSITIONS as readonly string[]);
       const pl: Record<string, number> = {};
+
+      // 2) gelen seviyeleri normalleştir, kilitli olanları YAZMA
       for (const [k, v] of Object.entries(dto.positionLevels)) {
-        if (!allowed.has(k)) continue;
+        const P = String(k).toUpperCase();
+        if (!allowed.has(P)) continue;
+        if (locked.has(P)) continue; // kilitliyse atla
         const n = Math.max(1, Math.min(10, Number(v)));
-        pl[k] = n;
+        pl[P] = n;
       }
-      data.positionLevels = J(pl);
+
+      if (Object.keys(pl).length > 0) {
+        data.positionLevels = J(pl);
+      }
     }
 
     if (dto?.availability || (dto?.items && Array.isArray(dto.items))) {
