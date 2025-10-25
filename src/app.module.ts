@@ -14,6 +14,7 @@ import { InvitesModule } from './invites/invites.module';
 import { RatingsModule } from './ratings/ratings.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { SeriesModule } from './series/series.module';
+import { TeamsModule } from './teams/teams.module';
 
 
 
@@ -57,6 +58,7 @@ import { SeriesModule } from './series/series.module';
     RatingsModule,
     NotificationsModule,
     SeriesModule,
+    TeamsModule,
   ],
 })
 export class AppModule {}

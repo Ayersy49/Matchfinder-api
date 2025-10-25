@@ -45,6 +45,17 @@ enum MatchStatus {
   CLOSED
 }
 
+enum TeamRole {
+  OWNER
+  ADMIN
+  PLAYER
+}
+
+enum TeamVisibility {
+  PUBLIC
+  PRIVATE
+}
+
 /**
  * ---------------- Modeller ----------------
  */
@@ -83,16 +94,27 @@ model User {
   userFriends Friendship[] @relation("UserFriends")
   friendsOf   Friendship[] @relation("UserFriendsOf")
 
-  // Back-relations
+  // Back-relations (mevcut)
   Message Message[] // -> Message.user
   Match   Match[] // -> Match.owner
 
-  // Davetler
+  // Davetler (maç)
   invitesSent     MatchInvite[] @relation("InviteFromUser")
   invitesReceived MatchInvite[] @relation("InviteToUser")
 
   // Erişim isteği: bu kullanıcının açtıkları
   accessRequestsSent MatchAccessRequest[] @relation("AccessRequestsFromUser")
+
+  // -------- Takım ilişkileri (YENİ back-relations) --------
+  teamsOwned        Team[]             @relation("TeamsOwner") // Team.owner
+  teamMemberships   TeamMember[] // TeamMember.user
+  teamChatMessages  TeamChatMessage[] // TeamChatMessage.user
+  teamPositionSlots TeamPositionSlot[] // TeamPositionSlot.user
+  teamJoinRequests  TeamJoinRequest[] // TeamJoinRequest.user
+
+  // Takım Davetleri (TeamInvite back-relations)
+  teamInvitesSent     TeamInvite[] @relation("TeamInviteInviter") // TeamInvite.inviter
+  teamInvitesReceived TeamInvite[] @relation("TeamInviteToUser") // TeamInvite.toUser
 
   // -------- Seri (tekrarlayan maç) ilişkileri (YENİ) --------
   seriesOwned              MatchSeries[] // -> MatchSeries.owner
@@ -204,9 +226,20 @@ model Match {
   // Haftalık yoklama (RSVP) back-relation (YENİ)
   attendances MatchAttendance[] // -> MatchAttendance.match
 
+  // Takımlar (nötr – home/away yok)
+  teamAId String?
+  teamBId String?
+  teamA   Team?   @relation("MatchTeamA", fields: [teamAId], references: [id])
+  teamB   Team?   @relation("MatchTeamB", fields: [teamBId], references: [id])
+
+  // ELO geçmişi back-relation (YENİ)
+  teamEloHistory TeamEloHistory[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@index([teamAId])
+  @@index([teamBId])
   @@index([seriesId])
 }
 
@@ -378,4 +411,182 @@ model MatchAttendance {
 
   @@unique([matchId, userId])
   @@index([userId])
+}
+
+// ---------------- TAKIM ----------------
+
+model Team {
+  id           String         @id @default(cuid())
+  name         String
+  ownerId      String
+  bio          String?
+  city         String?
+  district     String?
+  logoUrl      String?
+  visibility   TeamVisibility @default(PUBLIC)
+  discoverable Boolean        @default(true)
+
+  // Kuşbakışı sahada varsayılan formasyon
+  formationCode String @default("4-3-3") // "4-3-3" | "3-5-2" | "4-2-3-1"
+
+  // Özet metrikler
+  avgLevel         Float? // 1–10 arası ortalama
+  avgSportsmanship Float? // 1–10 arası ortalama
+  elo              Int    @default(1000)
+
+  // İlişkiler
+  members       TeamMember[]
+  invites       TeamInvite[]
+  chatMessages  TeamChatMessage[]
+  positionSlots TeamPositionSlot[]
+  joinRequests  TeamJoinRequest[]
+  eloHistory    TeamEloHistory[]
+
+  // Maç ve ilan back-relations (YENİ)
+  matchesAsTeamA     Match[]            @relation("MatchTeamA")
+  matchesAsTeamB     Match[]            @relation("MatchTeamB")
+  requestsOpened     TeamMatchRequest[] @relation("ReqTeam")
+  requestsAsOpponent TeamMatchRequest[] @relation("OppTeam")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // owner (isimli relation)
+  owner User @relation("TeamsOwner", fields: [ownerId], references: [id])
+
+  @@index([ownerId])
+}
+
+// Üyelik
+model TeamMember {
+  teamId            String
+  userId            String
+  role              TeamRole @default(PLAYER)
+  status            String   @default("ACTIVE") // ACTIVE | INVITED | LEFT | BANNED
+  number            Int?
+  preferredPosition String? // GK/LB/...
+  currentSlotKey    String? // sahadaki slot anahtarı (CB1 gibi)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id])
+
+  @@id([teamId, userId])
+  @@index([userId])
+}
+
+// Uygulama içi/dışı davet
+model TeamInvite {
+  id          String    @id @default(cuid())
+  teamId      String
+  invitedBy   String
+  toUserId    String?
+  toPhone     String?
+  status      String    @default("PENDING") // PENDING|ACCEPTED|REJECTED|EXPIRED|CANCELLED
+  message     String?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  respondedAt DateTime?
+
+  team    Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  inviter User  @relation("TeamInviteInviter", fields: [invitedBy], references: [id])
+  toUser  User? @relation("TeamInviteToUser", fields: [toUserId], references: [id])
+
+  @@index([teamId])
+  @@index([toUserId])
+  @@index([toPhone])
+}
+
+// Takım sohbeti
+model TeamChatMessage {
+  id        String    @id @default(cuid())
+  teamId    String
+  userId    String
+  text      String
+  editedAt  DateTime?
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([teamId, createdAt])
+}
+
+// Formasyon slotları (kuşbakışı yerleşim)
+model TeamPositionSlot {
+  id            String  @id @default(cuid())
+  teamId        String
+  formationCode String // ör. "4-3-3"
+  slotKey       String // GK | LB | CB1 | CB2 | ...
+  x             Int // 0–100
+  y             Int // 0–100
+  userId        String? // bu slota yerleşen üye
+  locked        Boolean @default(false) // app-dışı arkadaş için rezerve
+
+  team Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id])
+
+  @@unique([teamId, formationCode, slotKey])
+  @@index([teamId])
+}
+
+// Oyuncunun takıma başvurusu
+model TeamJoinRequest {
+  id        String    @id @default(cuid())
+  teamId    String
+  userId    String
+  position  String // hedef mevki
+  note      String?
+  status    String    @default("PENDING") // PENDING|APPROVED|REJECTED|WITHDRAWN
+  createdAt DateTime  @default(now())
+  decidedAt DateTime?
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([teamId, userId])
+  @@index([teamId])
+}
+
+// Rakip takım arama ilanı (home/away yok; iki takım adı yeter)
+model TeamMatchRequest {
+  id               String   @id @default(cuid())
+  requestingTeamId String
+  opponentTeamId   String?
+  // Maç parametreleri
+  date             DateTime
+  durationMin      Int
+  locationText     String
+  format           String // 6v6 | 7v7 | 11v11 ...
+  levelMin         Float?
+  levelMax         Float?
+  notes            String?
+  status           String   @default("OPEN") // OPEN|MATCHED|CANCELLED|EXPIRED
+
+  createdBy String
+  createdAt DateTime @default(now())
+
+  reqTeam Team  @relation("ReqTeam", fields: [requestingTeamId], references: [id])
+  oppTeam Team? @relation("OppTeam", fields: [opponentTeamId], references: [id])
+
+  @@index([requestingTeamId])
+  @@index([status])
+}
+
+// ELO geçmişi
+model TeamEloHistory {
+  id        String   @id @default(cuid())
+  teamId    String
+  matchId   String
+  delta     Int
+  newElo    Int
+  createdAt DateTime @default(now())
+
+  team  Team  @relation(fields: [teamId], references: [id])
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
 }
