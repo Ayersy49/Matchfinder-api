@@ -20,7 +20,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
     // Guard, return ettiğinizi req.user içine koyar
     // UsersController 'req.user.sub' ve 'req.user.phone' bekliyor
-    return sub ? { sub, phone } : null;
+    return { id: payload.sub, phone: payload.phone }; 
   }
 
 }

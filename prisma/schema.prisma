@@ -192,17 +192,20 @@ model MatchAccessRequest {
 }
 
 model Match {
-  id       String   @id @default(cuid())
+  id       String    @id @default(cuid())
   title    String
   location String?
-  level    String   @default("Orta")
-  format   String   @default("7v7")
-  price    Int?
-  time     DateTime @default(now())
-  slots    Json     @default("[]")
+  level    String    @default("Orta") // <- nullable
+  format   String    @default("7v7")
+  price    Int? // <- nullable
+  time     DateTime?
+  slots    Json      @default("[]")
   ownerId  String?
-  owner    User?    @relation(fields: [ownerId], references: [id])
-  listed   Boolean  @default(false)
+  owner    User?     @relation(fields: [ownerId], references: [id])
+  listed   Boolean   @default(false)
+
+  highlightUntil DateTime?
+  createdFrom    String? // 'TEAM_MATCH' vb.
 
   // Seri ile ilişki (YENİ)
   seriesId String?
@@ -428,11 +431,15 @@ model Team {
 
   // Kuşbakışı sahada varsayılan formasyon
   formationCode String @default("4-3-3") // "4-3-3" | "3-5-2" | "4-2-3-1"
+  size          Int    @default(11)
+
+  // Tekliflerde "teklif eden takım" back-relation'ı
+  offersAsOfferTeam TeamMatchOffer[] @relation("OfferTeam")
 
   // Özet metrikler
   avgLevel         Float? // 1–10 arası ortalama
   avgSportsmanship Float? // 1–10 arası ortalama
-  elo              Int    @default(1000)
+  elo              Int    @default(500)
 
   // İlişkiler
   members       TeamMember[]
@@ -572,8 +579,25 @@ model TeamMatchRequest {
   reqTeam Team  @relation("ReqTeam", fields: [requestingTeamId], references: [id])
   oppTeam Team? @relation("OppTeam", fields: [opponentTeamId], references: [id])
 
+  offers TeamMatchOffer[] // <— yeni back-relation
+
   @@index([requestingTeamId])
   @@index([status])
+}
+
+model TeamMatchOffer {
+  id          String   @id @default(cuid())
+  requestId   String
+  offerTeamId String
+  status      String   @default("PENDING") // PENDING|ACCEPTED|DECLINED
+  createdAt   DateTime @default(now())
+
+  request   TeamMatchRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  offerTeam Team             @relation("OfferTeam", fields: [offerTeamId], references: [id])
+
+  @@unique([requestId, offerTeamId]) // aynı takımdan ikinci kez teklif gelmesin
+  @@index([requestId])
+  @@index([offerTeamId])
 }
 
 // ELO geçmişi
