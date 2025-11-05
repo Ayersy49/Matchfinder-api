@@ -1,7 +1,7 @@
 // src/series/series.controller.ts
 import {
   BadRequestException, Body, Controller, Get, NotFoundException,
-  Param, Post, Query, Req, UnauthorizedException, UseGuards, ForbiddenException,
+  Param, Post, Query, Req, Patch, UnauthorizedException, UseGuards, ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -25,6 +25,9 @@ function firstOnOrAfter(start: Date, targetDow: number): Date {
 }
 function addDays(d: Date, n: number) { const x = new Date(d); x.setDate(x.getDate()+n); return x; }
 function addMinutes(d: Date, n: number) { return new Date(d.getTime() + n*60000); }
+function isNonNullDate(v: unknown): v is Date {
+  return v instanceof Date;
+}
 
 // Takım başına SUB sayısı: 5v5–6v6 → 1, 7v7–9v9 → 2, 10v10–11v11 → 3
 function reservesPerTeamByFormat(fmt: string) {
@@ -77,9 +80,14 @@ export class SeriesController {
     });
 
     // Görünebilir seriler + o serinin en yakın maçı
-    const visibleMap = new Map<string, { nextMatch?: { id: string; time: Date | string } }>();
+    // Görünebilir seriler + o serinin en yakın maçı
+    // (time'ı Date olarak tutuyoruz; string union'a gerek yok)
+    const visibleMap = new Map<string, { nextMatch?: { id: string; time: Date } }>();
 
     for (const m of upcoming) {
+      // 1) TS & runtime guard: time null ise atla
+      if (!m.time) continue;
+
       const sId = m.seriesId!;
       const slots = normalizeSlots(m.slots as any, m.format as any);
       const joined = userId ? slots.some(s => s.userId === userId) : false;
@@ -91,9 +99,15 @@ export class SeriesController {
       if (!canSee) continue;
 
       const cur = visibleMap.get(sId) || {};
-      if (!cur.nextMatch || new Date(m.time) < new Date(cur.nextMatch.time)) {
-        cur.nextMatch = { id: m.id, time: m.time };
+
+      // 2) Karşılaştırma: getTime() ile
+      const mt = m.time.getTime();
+      const ct = cur.nextMatch ? cur.nextMatch.time.getTime() : Number.POSITIVE_INFINITY;
+
+      if (!cur.nextMatch || mt < ct) {
+        cur.nextMatch = { id: m.id, time: m.time }; // 3) burada time kesin Date
       }
+
       visibleMap.set(sId, cur);
     }
 
@@ -163,6 +177,102 @@ export class SeriesController {
       };
     });
   }
+
+  @Get(':id')
+  async detail(@Req() req: any, @Param('id') id: string) {
+    const me = req.user?.id || req.user?.sub;
+    if (!me) throw new UnauthorizedException();
+
+    const s = await this.prisma.matchSeries.findUnique({
+      where: { id },
+      select: {
+        id: true, ownerId: true, title: true, location: true,
+        format: true, price: true, dayOfWeek: true, timeHHmm: true,
+        startDate: true, endDate: true, inviteOnly: true, reservesPerTeam: true,
+      },
+    });
+    if (!s) throw new NotFoundException('not_found');
+
+    // erişim: owner veya aktif üye
+    const isOwner = s.ownerId === me;
+    const isMember = !!(await this.prisma.seriesMember.findFirst({
+      where: { seriesId: id, userId: me, active: true },
+      select: { id: true },
+    }));
+    if (!isOwner && !isMember) throw new ForbiddenException('not_series_member');
+
+    const upcomingMatches = await this.prisma.match.findMany({
+      where: { seriesId: id },
+      select: { id: true, time: true },
+      orderBy: { time: 'asc' },
+      take: 50,
+    });
+
+    const { ownerId, ...rest } = s;
+    return { ...rest, upcomingMatches };
+  }
+
+  @Patch(':id')
+  async update(
+    @Req() req: any,
+    @Param('id') id: string,
+    @Body() b: Partial<{
+      title: string | null;
+      location: string | null;
+      format: string | null;
+      price: number | null;
+      dayOfWeek: number;
+      timeHHmm: string;
+      startDate: string; // "YYYY-MM-DD"
+      inviteOnly: boolean;
+      reservesPerTeam: number | null;
+    }>,
+  ) {
+    const me = req.user?.id || req.user?.sub;
+    if (!me) throw new UnauthorizedException();
+
+    const cur = await this.prisma.matchSeries.findUnique({
+      where: { id },
+      select: { ownerId: true, format: true },
+    });
+    if (!cur) throw new NotFoundException('series_not_found');
+    if (cur.ownerId !== me) throw new ForbiddenException('only_owner');
+
+    const normStr = (v: any) =>
+     typeof v === 'string' ? (v.trim() === '' ? null : v.trim()) : (v ?? null);
+
+    const data: any = {};
+    if ('title' in b) data.title = normStr(b.title);
+    if ('location' in b) data.location = normStr(b.location);
+    if ('format' in b && b.format) data.format = String(b.format);
+    if ('price' in b) data.price = b.price === null ? null : Number(b.price);
+    if ('dayOfWeek' in b) {
+      const dow = Number(b.dayOfWeek);
+      if (!(dow >= 1 && dow <= 7)) throw new BadRequestException('dayOfWeek 1..7');
+      data.dayOfWeek = dow;
+    }
+    if ('timeHHmm' in b && b.timeHHmm) {
+      parseHHmm(String(b.timeHHmm));
+      data.timeHHmm = String(b.timeHHmm);
+    }
+    if ('startDate' in b && b.startDate) data.startDate = new Date(b.startDate);
+    if ('inviteOnly' in b) data.inviteOnly = !!b.inviteOnly;
+    if ('reservesPerTeam' in b) {
+      data.reservesPerTeam =
+        b.reservesPerTeam === null || b.reservesPerTeam === undefined
+          ? null
+          : Number(b.reservesPerTeam);
+    }
+
+    // format değiştiyse ve reservesPerTeam gelmediyse defaultla
+    if ('format' in b && !('reservesPerTeam' in b)) {
+      data.reservesPerTeam = reservesPerTeamByFormat(String(b.format || cur.format || '7v7'));
+    }
+
+    await this.prisma.matchSeries.update({ where: { id }, data });
+    return { ok: true };
+  }
+
 
   // ---------- Serilerimi listele + sıradaki maçı garanti et ----------
   @Get()
@@ -257,7 +367,7 @@ export class SeriesController {
     );
     let d = new Date(base.getFullYear(), base.getMonth(), base.getDate(), hh, mm, 0, 0);
     if (d < ref) d = addDays(d, 7);
-    if (s.endDate && d > new Date(s.endDate)) return null;
+    if (isNonNullDate(s.endDate) && d > s.endDate) return null;
     return d;
   }
 
@@ -396,7 +506,7 @@ export class SeriesController {
     let created = 0;
     for (let i=0;i<weeks;i++){
       const day = addDays(start, i*7);
-      if (s.endDate && day > new Date(s.endDate)) break;
+      if (isNonNullDate(s.endDate) && day > s.endDate) break;
 
       const when = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hh, mm, 0, 0);
 
