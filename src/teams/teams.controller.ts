@@ -111,11 +111,13 @@ function toBasePos(p?: string | null) {
   if (t.startsWith('ST')) return 'ST';
   return ['GK','LB','RB','LWB','RWB','AM','LW','RW'].includes(t) ? t : 'CM';
 }
+
 function fillTeamSlots(
   preset: string[],
-  members: Array<{userId:string; preferredPosition?:string|null}>
+  members: Array<{userId:string; preferredPosition?:string|null}>,
+  team: 'A' | 'B'
 ){
-  const pool = [...members]; // dilersen role/OWNER-ADMIN önceliği için sırala
+  const pool = [...members];
   const take = (pos:string) => {
     const idx = pool.findIndex(m => toBasePos(m.preferredPosition) === toBasePos(pos));
     if (idx >= 0) return pool.splice(idx,1)[0];
@@ -124,8 +126,8 @@ function fillTeamSlots(
   const slots:any[] = [];
   for (const pos of preset) {
     const m = take(pos);
-    if (m) slots.push({ pos, userId: m.userId });
-    else slots.push({ pos, placeholder: 'ADMIN' });
+    if (m) slots.push({ team, pos, userId: m.userId });
+    else slots.push({ team, pos, placeholder: 'ADMIN' });
   }
   return slots;
 }
@@ -820,8 +822,9 @@ export class TeamsController {
         }),
       ]);
 
-      const slotsA = fillTeamSlots(preset, teamAMembers);
-      const slotsB = fillTeamSlots(preset, teamBMembers);
+      const slotsA = fillTeamSlots(preset, teamAMembers, 'A');
+      const slotsB = fillTeamSlots(preset, teamBMembers, 'B');
+
 
       // 5) Maçı oluştur
       const title = `${updatedReq.reqTeam?.name ?? 'A'} vs ${offerTeam?.name ?? 'B'}`;
