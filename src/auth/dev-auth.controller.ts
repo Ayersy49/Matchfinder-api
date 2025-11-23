@@ -30,7 +30,11 @@ export class DevAuthController {
     }
 
     // token’ı aynı secret ile üret
-    const token = await this.jwt.signAsync({ id: userId });
-    return { ok: true, token, userId };
+    // mümkünse phone da ekle
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { phone: true } });
+    const token = await this.jwt.signAsync({ sub: userId, phone: user?.phone ?? null });
+    // frontend hangi key'i okuyorsa onu dön (sen hem token hem accessToken okuyorsun)
+    return { ok: true, token, accessToken: token, userId };
+
   }
 }

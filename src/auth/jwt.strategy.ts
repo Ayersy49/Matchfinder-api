@@ -7,20 +7,26 @@ import { ConfigService } from '@nestjs/config';
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(config: ConfigService) {
     super({
-      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      jwtFromRequest: ExtractJwt.fromExtractors([
+        (req) => (req?.cookies?.token as string) || null,     // varsa cookie'den
+        ExtractJwt.fromAuthHeaderAsBearerToken(),             // yoksa Authorization
+      ]),
       ignoreExpiration: false,
       secretOrKey: config.get<string>('JWT_SECRET') || 'dev-secret',
     });
   }
 
   async validate(payload: any) {
-    // Token içindeki alanları normalize et
+    // payload hangi alanla gelirse gelsin normalize et
     const sub = payload?.sub ?? payload?.id ?? payload?.userId ?? null;
     const phone = payload?.phone ?? null;
 
-    // Guard, return ettiğinizi req.user içine koyar
-    // UsersController 'req.user.sub' ve 'req.user.phone' bekliyor
-    return { id: payload.sub, phone: payload.phone }; 
+    // sub yoksa yetkilendirme başarısız (401)
+    if (!sub) return null;
+
+    // UsersController getUserId: req.user.id | req.user.sub | ...
+    return { id: String(sub), phone: phone ?? null };
   }
+
 
 }

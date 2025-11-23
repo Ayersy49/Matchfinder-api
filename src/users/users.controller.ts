@@ -15,6 +15,8 @@ import { AuthGuard } from '@nestjs/passport';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
+
+
 /* ----------------- Helpers / Types ----------------- */
 
 const J = (v: unknown) => v as unknown as Prisma.InputJsonValue;
@@ -38,6 +40,12 @@ function getUserId(req: any): string | undefined {
   return req?.user?.id || req?.user?.sub || req?.user?.userId || undefined;
 }
 
+// Basit DTO'lar
+class UpdateLocationDto { lat!: number; lng!: number; }
+class ToggleDiscoverableDto { value!: boolean; }
+class UpdateAvailabilityDto { availability!: any; }
+
+
 const isTime = (s: any) =>
   typeof s === 'string' &&
   /^\d{2}:\d{2}$/.test(s) &&
@@ -60,6 +68,26 @@ function mergeIntervals(list: Interval[]): Interval[] {
   }
   return out;
 }
+
+function isAvailableAt(av: Avail, dow: number, hhmm: string) {
+  const key = DOW_TO_KEY[dow as 1|2|3|4|5|6|7];
+  const list = (av && (av as any)[key]) as Interval[] | undefined;
+  if (!list) return false;
+  return list.some((iv) => iv.start <= hhmm && hhmm <= iv.end);
+}
+
+
+
+function distanceKm(a: {lat:number,lng:number}, b:{lat:number,lng:number}) {
+  const R = 6371;
+  const dLat = (Math.PI/180)*(b.lat - a.lat);
+  const dLng = (Math.PI/180)*(b.lng - a.lng);
+  const s1 = Math.sin(dLat/2), s2 = Math.sin(dLng/2);
+  const A = s1*s1 + Math.cos((Math.PI/180)*a.lat) * Math.cos((Math.PI/180)*b.lat) * s2*s2;
+  return 2 * R * Math.asin(Math.sqrt(A));
+}
+
+
 
 /** Her türlü payload'ı (yeni veya legacy) Avail formatına normalize eder. */
 function normalizeAvail(input: any): Avail {
@@ -130,7 +158,7 @@ export class UsersController {
   @UseGuards(AuthGuard('jwt'))
   @Get('me')
   async me(@Req() req: any) {
-    const id = req.user?.sub as string | undefined;
+    const id = (req.user?.id || req.user?.sub) as string | undefined;
     const phoneDigits = String(req.user?.phone ?? '').replace(/\D/g, '');
 
     let user = id ? await this.prisma.user.findUnique({ where: { id } }) : null;
@@ -473,14 +501,18 @@ export class UsersController {
   }
 
   /** Yakındaki oyuncular */
-  @UseGuards(AuthGuard('jwt'))
   @Get('discover')
   async discover(
     @Req() req: any,
     @Query('lat') latQ?: string,
     @Query('lng') lngQ?: string,
     @Query('radiusKm') radiusQ?: string,
+    @Query('dow') dowQ?: string,       // 1..7 (Mon..Sun, Pazar=7)
+    @Query('at') atQ?: string,         // "21:00"
+    @Query('for') forQ?: string,       // ISO datetime -> dow+at türetir
+    @Query('pos') posQ?: string,       // "GK,CB" (opsiyonel)
   ) {
+
     const meId = getUserId(req);
     if (!meId) throw new UnauthorizedException();
 
@@ -489,6 +521,7 @@ export class UsersController {
     let baseLat = Number(latQ);
     let baseLng = Number(lngQ);
     if (!Number.isFinite(baseLat) || !Number.isFinite(baseLng)) {
+      
       const me = await this.prisma.user.findUnique({
         where: { id: meId },
         select: { lat: true, lng: true },
@@ -498,6 +531,24 @@ export class UsersController {
       baseLng = me.lng!;
     }
 
+    let dow: number | null = dowQ ? Number(dowQ) : null;
+    let at: string | null = atQ || null;
+    if (forQ) {
+      const d = new Date(forQ);
+      if (!isNaN(+d)) {
+        // JS getDay(): 0=Sun..6=Sat  -> 1=Mon..7=Sun'a çeviriyoruz
+        dow = ((d.getDay() + 6) % 7) + 1;
+        at = d.toTimeString().slice(0, 5); // "HH:MM"
+      }
+    }
+
+    const wantPos = new Set(
+      (posQ || '')
+        .split(',')
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean)
+    );
+
     const candidates = await this.prisma.user.findMany({
       where: {
         discoverable: true,
@@ -505,7 +556,7 @@ export class UsersController {
         lat: { not: null },
         lng: { not: null },
       },
-      select: { id: true, phone: true, level: true, positions: true, lat: true, lng: true },
+      select: { id: true, phone: true, level: true, positions: true, availability: true, lat: true, lng: true },
     });
 
     const toRad = (x: number) => (x * Math.PI) / 180;
@@ -523,8 +574,11 @@ export class UsersController {
     const items = candidates
       .map((u) => {
         const dist = haversineKm(baseLat, baseLng, Number(u.lat), Number(u.lng));
-        let pos: string[] | null = null;
-        if (Array.isArray(u.positions)) pos = (u.positions as any[]).map(String);
+        const pos = Array.isArray(u.positions) ? (u.positions as any[]).map((p) => String(p).toUpperCase()) : [];
+        const avail = coerceFromDb(u.availability);
+        const okPos = wantPos.size === 0 || pos.some((p) => wantPos.has(p));
+        const okAvail = dow && at ? isAvailableAt(avail, dow, at) : true;
+
         return {
           id: u.id,
           phone: u.phone ?? null,
@@ -533,12 +587,13 @@ export class UsersController {
           lat: Number(u.lat),
           lng: Number(u.lng),
           distanceKm: dist,
+          _ok: okPos && okAvail,
         };
       })
-      .filter((x) => x.distanceKm <= radiusKm)
+      .filter((x) => x._ok && x.distanceKm <= radiusKm)
       .sort((a, b) => a.distanceKm - b.distanceKm)
-      .slice(0, 100);
-
+      .slice(0, 100)
+      .map(({ _ok, ...rest }) => rest);
     return { items };
   }
 }

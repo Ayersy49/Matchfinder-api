@@ -39,6 +39,11 @@ enum AccessStatus {
   DECLINED
 }
 
+enum VoteType {
+  ACCEPT
+  REJECT
+}
+
 enum MatchStatus {
   DRAFT
   OPEN
@@ -266,6 +271,23 @@ model MatchInvite {
   @@index([toUserId])
   @@index([toPhone])
 }
+
+
+model MatchTimeProposal {
+  id        String   @id @default(cuid())
+  matchId   String
+  time      DateTime
+  byId      String
+  createdAt DateTime @default(now())
+  votesUp   Int      @default(0)
+  votesDown Int      @default(0)
+  ackA      Boolean  @default(false) // Takım A kaptan onayı
+  ackB      Boolean  @default(false) // Takım B kaptan onayı
+  appliedAt DateTime?
+  match     Match    @relation(fields: [matchId], references: [id])
+}
+
+
 
 model Rating {
   id      String @id @default(cuid())
