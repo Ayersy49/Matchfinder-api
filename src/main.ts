@@ -3,6 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe, LogLevel, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { Request, Response, NextFunction } from 'express';
 
 async function bootstrap() {
   const raw = process.env.NEST_LOG_LEVELS || 'log,warn,error';
@@ -17,6 +18,20 @@ async function bootstrap() {
     exposedHeaders: ['Authorization'],
     credentials: true,
   });
+
+  // --- AUTH HEADER DEBUG (isteğe bağlı ama çok faydalı) ---
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    if (req.path.startsWith('/users') || req.path.startsWith('/auth')) {
+      const auth   = req.headers['authorization'];
+      const cookie = req.headers['cookie'];
+      Logger.debug(
+        `path=${req.path} origin=${req.headers.origin ?? '-'} auth=${auth ?? '-'} cookie=${cookie ? '(var)' : '(yok)'}`,
+        'AuthDebug',
+      );
+    }
+    next();
+  });
+  // ---------------------------------------------------------
 
   app.useGlobalPipes(
     new ValidationPipe({

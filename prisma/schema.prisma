@@ -80,6 +80,19 @@ model User {
   lng          Float?
   discoverable Boolean @default(false)
 
+  // Auth (Password-based)
+  password String? // Hashed password
+  username String? @unique
+  email    String? @unique
+  name     String?
+  lastname String?
+
+  // Physical Stats
+  age      Int?
+  height   Int?
+  weight   Int?
+  gender   String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -197,17 +210,19 @@ model MatchAccessRequest {
 }
 
 model Match {
-  id       String    @id @default(cuid())
-  title    String
-  location String?
-  level    String    @default("Orta") // <- nullable
-  format   String    @default("7v7")
-  price    Int? // <- nullable
-  time     DateTime?
-  slots    Json      @default("[]")
-  ownerId  String?
-  owner    User?     @relation(fields: [ownerId], references: [id])
-  listed   Boolean   @default(false)
+  id            String              @id @default(cuid())
+  title         String
+  location      String?
+  level         String              @default("Orta") // <- nullable
+  format        String              @default("7v7")
+  price         Int? // <- nullable
+  time          DateTime?
+  slots         Json                @default("[]")
+  ownerId       String?
+  owner         User?               @relation(fields: [ownerId], references: [id])
+  listed        Boolean             @default(false)
+  // ---- ZAMAN ÖNERİLERİ (karşı alan) ----
+  timeProposals MatchTimeProposal[] @relation("MatchTimeProposals")
 
   highlightUntil DateTime?
   createdFrom    String? // 'TEAM_MATCH' vb.
@@ -272,22 +287,19 @@ model MatchInvite {
   @@index([toPhone])
 }
 
-
 model MatchTimeProposal {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   matchId   String
   time      DateTime
   byId      String
-  createdAt DateTime @default(now())
-  votesUp   Int      @default(0)
-  votesDown Int      @default(0)
-  ackA      Boolean  @default(false) // Takım A kaptan onayı
-  ackB      Boolean  @default(false) // Takım B kaptan onayı
+  createdAt DateTime  @default(now())
+  votesUp   Int       @default(0)
+  votesDown Int       @default(0)
+  ackA      Boolean   @default(false) // Takım A kaptan onayı
+  ackB      Boolean   @default(false) // Takım B kaptan onayı
   appliedAt DateTime?
-  match     Match    @relation(fields: [matchId], references: [id])
+  match     Match     @relation("MatchTimeProposals", fields: [matchId], references: [id])
 }
-
-
 
 model Rating {
   id      String @id @default(cuid())

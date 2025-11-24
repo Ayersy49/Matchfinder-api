@@ -1,5 +1,5 @@
-// src/auth/auth.controller.ts
-import { Body, Controller, HttpCode, Post } from '@nestjs/common';
+import { Body, Controller, HttpCode, Post, UseGuards, Req, UnauthorizedException } from '@nestjs/common';
+import { AuthGuard } from '@nestjs/passport';
 import { AuthService } from './auth.service';
 import { IsNotEmpty, IsString, Length } from 'class-validator';
 
@@ -22,7 +22,7 @@ class VerifyOtpDto {
 
 @Controller('auth/otp')
 export class AuthController {
-  constructor(private readonly auth: AuthService) {}
+  constructor(private readonly auth: AuthService) { }
 
   @Post('request')
   @HttpCode(200)
@@ -40,10 +40,25 @@ export class AuthController {
   async verify(@Body() dto: VerifyOtpDto) {
     try {
       const res = await this.auth.verifyOtp(dto.phone, dto.code);
-      return res.ok ? { ok: true, accessToken: (res as any).accessToken } : res;
+      return res.ok ? { ok: true, accessToken: (res as any).accessToken, isNew: (res as any).isNew } : res;
     } catch (e) {
       console.error('verify error', e);
       return { ok: false, reason: 'server_error' };
     }
+  }
+
+  @Post('login')
+  @HttpCode(200)
+  async login(@Body() body: { identifier: string; password: string }) {
+    return this.auth.loginWithPassword(body.identifier, body.password);
+  }
+
+  @Post('set-password')
+  @UseGuards(AuthGuard('jwt'))
+  @HttpCode(200)
+  async setPassword(@Req() req: any, @Body() body: { password: string; currentPassword?: string }) {
+    const userId = req.user?.id || req.user?.sub;
+    if (!userId) throw new UnauthorizedException();
+    return this.auth.setPassword(userId, body.password, body.currentPassword);
   }
 }

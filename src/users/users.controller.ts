@@ -70,7 +70,7 @@ function mergeIntervals(list: Interval[]): Interval[] {
 }
 
 function isAvailableAt(av: Avail, dow: number, hhmm: string) {
-  const key = DOW_TO_KEY[dow as 1|2|3|4|5|6|7];
+  const key = DOW_TO_KEY[dow as 1 | 2 | 3 | 4 | 5 | 6 | 7];
   const list = (av && (av as any)[key]) as Interval[] | undefined;
   if (!list) return false;
   return list.some((iv) => iv.start <= hhmm && hhmm <= iv.end);
@@ -78,12 +78,12 @@ function isAvailableAt(av: Avail, dow: number, hhmm: string) {
 
 
 
-function distanceKm(a: {lat:number,lng:number}, b:{lat:number,lng:number}) {
+function distanceKm(a: { lat: number, lng: number }, b: { lat: number, lng: number }) {
   const R = 6371;
-  const dLat = (Math.PI/180)*(b.lat - a.lat);
-  const dLng = (Math.PI/180)*(b.lng - a.lng);
-  const s1 = Math.sin(dLat/2), s2 = Math.sin(dLng/2);
-  const A = s1*s1 + Math.cos((Math.PI/180)*a.lat) * Math.cos((Math.PI/180)*b.lat) * s2*s2;
+  const dLat = (Math.PI / 180) * (b.lat - a.lat);
+  const dLng = (Math.PI / 180) * (b.lng - a.lng);
+  const s1 = Math.sin(dLat / 2), s2 = Math.sin(dLng / 2);
+  const A = s1 * s1 + Math.cos((Math.PI / 180) * a.lat) * Math.cos((Math.PI / 180) * b.lat) * s2 * s2;
   return 2 * R * Math.asin(Math.sqrt(A));
 }
 
@@ -152,7 +152,7 @@ function colorOf(total: number) {
 
 @Controller('users')
 export class UsersController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService) { }
 
   /** Kimlikli kullanıcı (yoksa phone’dan upsert) */
   @UseGuards(AuthGuard('jwt'))
@@ -214,6 +214,12 @@ export class UsersController {
       level: Number(upperLevels[p] ?? user.level ?? 5),
     }));
 
+    // Fetch fresh account data via Raw SQL to bypass stale Prisma Client
+    const fresh: any[] = await this.prisma.$queryRawUnsafe(
+      `SELECT name, username, email, lastname FROM "User" WHERE id = ?`,
+      user.id
+    );
+    const f = fresh[0] || {};
 
     return {
       id: user.id,
@@ -232,6 +238,15 @@ export class UsersController {
       posLocked,
       topPositions: top3,
       top3WithLevels,
+      height: (user as any).height ?? null,
+      weight: (user as any).weight ?? null,
+      gender: (user as any).gender ?? null,
+      age: (user as any).age ?? null,
+      // Use fresh data from Raw SQL
+      name: f.name ?? null,
+      username: f.username ?? null,
+      email: f.email ?? null,
+      lastname: f.lastname ?? null,
     };
   }
 
@@ -250,6 +265,39 @@ export class UsersController {
     if (typeof dto?.level === 'number') {
       data.level = Math.max(1, Math.min(10, dto.level));
     }
+
+    // Account Info (Raw SQL to bypass stale client)
+    const updates: string[] = [];
+    const params: any[] = [];
+
+    if (dto?.username !== undefined) {
+      updates.push('username = ?');
+      params.push(dto.username || null);
+    }
+    if (dto?.email !== undefined) {
+      updates.push('email = ?');
+      params.push(dto.email || null);
+    }
+    if (dto?.name !== undefined) {
+      updates.push('name = ?');
+      params.push(dto.name || null);
+    }
+    if (dto?.lastname !== undefined) {
+      updates.push('lastname = ?');
+      params.push(dto.lastname || null);
+    }
+
+    if (updates.length > 0) {
+      params.push(id);
+      const sql = `UPDATE "User" SET ${updates.join(', ')} WHERE id = ?`;
+      await this.prisma.$executeRawUnsafe(sql, ...params);
+    }
+
+    // Physical Stats
+    if (typeof dto?.age === 'number') (data as any).age = dto.age;
+    if (typeof dto?.height === 'number') (data as any).height = dto.height;
+    if (typeof dto?.weight === 'number') (data as any).weight = dto.weight;
+    if (typeof dto?.gender === 'string') (data as any).gender = dto.gender;
 
     if (Array.isArray(dto?.positions)) {
       const allowed = new Set(ALLOWED_POSITIONS as readonly string[]);
@@ -310,6 +358,14 @@ export class UsersController {
     }
 
     const updated = await this.prisma.user.update({ where: { id }, data });
+
+    // Fetch fresh account data via Raw SQL to bypass stale Prisma Client
+    const fresh: any[] = await this.prisma.$queryRawUnsafe(
+      `SELECT name, username, email, lastname FROM "User" WHERE id = ?`,
+      id
+    );
+    const f = fresh[0] || {};
+
     return {
       id: updated.id,
       positions: Array.isArray(updated.positions) ? (updated.positions as any[]) : [],
@@ -325,6 +381,16 @@ export class UsersController {
       lng: updated.lng ?? null,
       discoverable: !!updated.discoverable,
       updatedAt: updated.updatedAt,
+      // Use fresh data from Raw SQL
+      name: f.name ?? null,
+      username: f.username ?? null,
+      email: f.email ?? null,
+      lastname: f.lastname ?? null,
+      // Physical stats from updated object (these were already in schema)
+      height: (updated as any).height ?? null,
+      weight: (updated as any).weight ?? null,
+      gender: (updated as any).gender ?? null,
+      age: (updated as any).age ?? null,
     };
   }
 
@@ -342,23 +408,6 @@ export class UsersController {
     await this.prisma.user.update({ where: { id }, data: { discoverable: next } });
 
     return { ok: true, discoverable: next };
-  }
-
-  /** Konumu yaz (lat,lng) */
-  @UseGuards(AuthGuard('jwt'))
-  @Put('me/location')
-  async setLocation(@Req() req: any, @Body() body: any) {
-    const id = getUserId(req);
-    if (!id) throw new UnauthorizedException();
-
-    const lat = Number(body?.lat);
-    const lng = Number(body?.lng);
-    const latOk = Number.isFinite(lat) && lat >= -90 && lat <= 90;
-    const lngOk = Number.isFinite(lng) && lng >= -180 && lng <= 180;
-    if (!latOk || !lngOk) throw new BadRequestException('invalid_lat_lng');
-
-    await this.prisma.user.update({ where: { id }, data: { lat, lng } });
-    return { ok: true };
   }
 
   /** Başkasının herkese açık profili (arkadaşa availability göster) */
@@ -415,20 +464,6 @@ export class UsersController {
 
   @UseGuards(AuthGuard('jwt'))
   @Post('me/availability')
-  async setMyAvailability(@Req() req: any, @Body() body: any) {
-    const userId = getUserId(req);
-    if (!userId) throw new BadRequestException('no_user');
-
-    const availability = normalizeAvail(body);
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { availability: J(availability) },
-      select: { id: true },
-    });
-
-    return { ok: true, availability };
-  }
-
   /** Davranış özeti (ağırlıklı) – eski kolon adlarıyla */
   @Get(':id/behavior')
   async behavior(@Param('id') id: string) {
@@ -443,30 +478,30 @@ export class UsersController {
       return { avg: null, si: 70, total: 70, color: 'green', samples: 0 };
     }
 
-    let wsum = 0, P=0, R=0, S=0, W=0, A=0;
+    let wsum = 0, P = 0, R = 0, S = 0, W = 0, A = 0;
     for (const r of rows) {
       const w = r.weight || 1;
       const t = (r.traits || {}) as any;
-      const p  = Number(t.punctuality)   || 0;
-      const rs = Number(t.respect)       || 0;
+      const p = Number(t.punctuality) || 0;
+      const rs = Number(t.respect) || 0;
       const sp = Number(t.sportsmanship) || 0;
-      const sw = Number(t.swearing)      || 0;
-      const ag = Number(t.aggression)    || 0;
+      const sw = Number(t.swearing) || 0;
+      const ag = Number(t.aggression) || 0;
       wsum += w;
       P += w * p; R += w * rs; S += w * sp; W += w * sw; A += w * ag;
     }
     const avg = {
-      punctuality:   P/wsum,
-      respect:       R/wsum,
-      sportsmanship: S/wsum,
-      swearing:      W/wsum,
-      aggression:    A/wsum,
+      punctuality: P / wsum,
+      respect: R / wsum,
+      sportsmanship: S / wsum,
+      swearing: W / wsum,
+      aggression: A / wsum,
     };
 
-    const n = (x:number)=> (x-1)/4;
+    const n = (x: number) => (x - 1) / 4;
     const total = Math.round(100 * (
-      0.15*n(avg.punctuality) + 0.25*n(avg.respect) + 0.25*n(avg.sportsmanship) +
-      0.20*n(avg.swearing)    + 0.15*n(avg.aggression)
+      0.15 * n(avg.punctuality) + 0.25 * n(avg.respect) + 0.25 * n(avg.sportsmanship) +
+      0.20 * n(avg.swearing) + 0.15 * n(avg.aggression)
     ));
     const color = total >= 90 ? 'blue' : total >= 60 ? 'green' : total >= 40 ? 'yellow' : 'red';
 
@@ -501,6 +536,7 @@ export class UsersController {
   }
 
   /** Yakındaki oyuncular */
+  @UseGuards(AuthGuard('jwt'))
   @Get('discover')
   async discover(
     @Req() req: any,
@@ -521,7 +557,7 @@ export class UsersController {
     let baseLat = Number(latQ);
     let baseLng = Number(lngQ);
     if (!Number.isFinite(baseLat) || !Number.isFinite(baseLng)) {
-      
+
       const me = await this.prisma.user.findUnique({
         where: { id: meId },
         select: { lat: true, lng: true },
