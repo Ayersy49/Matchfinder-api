@@ -142,6 +142,9 @@ model User {
   // Haftalık yoklama (RSVP) (YENİ)
   attendances MatchAttendance[] // -> MatchAttendance.user
 
+  // Maç raporları
+  matchReports MatchReport[] // -> MatchReport.reporter
+
   @@index([lat, lng])
 }
 
@@ -254,6 +257,14 @@ model Match {
   teamBId String?
   teamA   Team?   @relation("MatchTeamA", fields: [teamAId], references: [id])
   teamB   Team?   @relation("MatchTeamB", fields: [teamBId], references: [id])
+
+  // ===== SKOR VE DOĞRULAMA =====
+  scoreTeamA         Int?      // Takım A skoru
+  scoreTeamB         Int?      // Takım B skoru
+  verificationStatus String    @default("NONE") // NONE | PENDING | VERIFIED | DISPUTED | INVALID
+  verifiedAt         DateTime? // Doğrulama zamanı
+  disputeDeadline    DateTime? // 48 saat sonra (anlaşmazlık süresi)
+  matchReports       MatchReport[] // Takımların raporları
 
   // ELO geçmişi back-relation (YENİ)
   teamEloHistory TeamEloHistory[]
@@ -475,6 +486,12 @@ model Team {
   avgSportsmanship Float? // 1–10 arası ortalama
   elo              Int    @default(500)
 
+  // ===== ELO SİSTEMİ ALANLARI =====
+  reputationScore Float @default(5.0) // İtibar Puanı: 1.0 - 5.0
+  winStreak       Int   @default(0)   // Ardışık galibiyet
+  lossStreak      Int   @default(0)   // Ardışık mağlubiyet
+  matchCount      Int   @default(0)   // Toplam oynanan maç (provisional için)
+
   // İlişkiler
   members       TeamMember[]
   invites       TeamInvite[]
@@ -482,6 +499,7 @@ model Team {
   positionSlots TeamPositionSlot[]
   joinRequests  TeamJoinRequest[]
   eloHistory    TeamEloHistory[]
+  matchReports  MatchReport[] // Maç raporları
 
   // Maç ve ilan back-relations (YENİ)
   matchesAsTeamA     Match[]            @relation("MatchTeamA")
@@ -643,8 +661,39 @@ model TeamEloHistory {
   newElo    Int
   createdAt DateTime @default(now())
 
+  // ===== DETAY ALANLARI =====
+  eloBeforeMatch  Int?   // Maç öncesi Elo
+  teamRating      Float? // Takım rating (TR)
+  opponentElo     Int?   // Rakip Elo
+  opponentRating  Float? // Rakip rating
+  expectedWinProb Float? // Beklenen kazanma olasılığı (P)
+  actualOutcome   Float? // Gerçek sonuç (1.0/0.5/0.0)
+  tcf             Float? // Team Consistency Factor
+  streakFactor    Float? // Streak scaling factor
+
   team  Team  @relation(fields: [teamId], references: [id])
   match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
 
+  @@index([teamId])
+}
+
+// ===== MAÇ RAPORU (Skor Bildirimi) =====
+model MatchReport {
+  id           String   @id @default(cuid())
+  matchId      String
+  teamId       String
+  reporterId   String
+  reporterRole String   // CAPTAIN | ADMIN | PLAYER
+  scoreTeamA   Int
+  scoreTeamB   Int
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  match    Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  team     Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  reporter User  @relation(fields: [reporterId], references: [id], onDelete: Cascade)
+
+  @@unique([matchId, teamId]) // Her takım maç başına tek rapor
+  @@index([matchId])
   @@index([teamId])
 }

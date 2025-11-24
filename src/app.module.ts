@@ -15,6 +15,7 @@ import { RatingsModule } from './ratings/ratings.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { SeriesModule } from './series/series.module';
 import { TeamsModule } from './teams/teams.module';
+import { EloModule } from './elo/elo.module';
 
 
 
@@ -59,6 +60,7 @@ import { TeamsModule } from './teams/teams.module';
     NotificationsModule,
     SeriesModule,
     TeamsModule,
+    EloModule,
   ],
 })
 export class AppModule {}
