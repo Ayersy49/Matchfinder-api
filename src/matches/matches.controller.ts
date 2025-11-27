@@ -1522,10 +1522,20 @@ export class MatchesController {
       where: { matchId },
       orderBy: { createdAt: 'desc' },
       take,
+      include: { user: { select: { id: true, username: true, phone: true } } },
       ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
     });
 
-    return { items: messages.reverse() };
+    return {
+      items: messages.reverse().map((m: any) => ({
+        ...m,
+        user: m.user ? {
+          id: m.user.id,
+          username: m.user.username || null,
+          phone: m.user.phone ? m.user.phone.slice(-3) : null,
+        } : null,
+      })),
+    };
   }
 
   @UseGuards(JwtAuthGuard)
@@ -1549,9 +1559,20 @@ export class MatchesController {
 
     const msg = await this.prisma.message.create({
       data: { matchId, userId, text },
+      include: { user: { select: { id: true, username: true, phone: true } } },
     });
 
-    return { ok: true, message: msg };
+    return {
+      ok: true,
+      message: {
+        ...msg,
+        user: msg.user ? {
+          id: msg.user.id,
+          username: msg.user.username || null,
+          phone: msg.user.phone ? msg.user.phone.slice(-3) : null,
+        } : null,
+      },
+    };
   }
 
   @UseGuards(JwtAuthGuard)
@@ -1837,6 +1858,272 @@ export class MatchesController {
       canSubB: hasSubHoleB,
       items: scored,
     };
+  }
+
+  /* ===================== MAÇ SONUCU BİLDİRME ===================== */
+
+  // Mevcut raporları getir
+  @UseGuards(JwtAuthGuard)
+  @Get(':id/reports')
+  async getMatchReports(
+    @Req() req: any,
+    @Param('id') matchId: string,
+  ) {
+    const userId = getUserIdFromReq(req);
+    if (!userId) throw new UnauthorizedException();
+
+    const match = await this.prisma.match.findUnique({
+      where: { id: matchId },
+      select: { 
+        id: true, 
+        teamAId: true, 
+        teamBId: true, 
+        createdFrom: true,
+        seriesId: true,
+        teamA: { select: { id: true, name: true } },
+        teamB: { select: { id: true, name: true } },
+      },
+    });
+    if (!match) throw new NotFoundException('match not found');
+
+    const reports = await this.prisma.matchReport.findMany({
+      where: { matchId },
+      include: {
+        team: { select: { id: true, name: true } },
+        reporter: { select: { id: true, username: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    // Score -> Result dönüşümü
+    const toResult = (scoreA: number, scoreB: number): 'TEAM_A' | 'TEAM_B' | 'DRAW' => {
+      if (scoreA > scoreB) return 'TEAM_A';
+      if (scoreB > scoreA) return 'TEAM_B';
+      return 'DRAW';
+    };
+
+    // Skorlar uyuşuyor mu?
+    let isConsensus = false;
+    let finalResult: 'TEAM_A' | 'TEAM_B' | 'DRAW' | null = null;
+
+    if (reports.length >= 2) {
+      const r1 = reports[0];
+      const r2 = reports[1];
+      if (r1.scoreTeamA === r2.scoreTeamA && r1.scoreTeamB === r2.scoreTeamB) {
+        isConsensus = true;
+        finalResult = toResult(r1.scoreTeamA, r1.scoreTeamB);
+      }
+    }
+
+    // Raporları result formatına dönüştür
+    const reportsWithResult = reports.map(r => ({
+      ...r,
+      result: toResult(r.scoreTeamA, r.scoreTeamB),
+    }));
+
+    return {
+      reports: reportsWithResult,
+      isConsensus,
+      finalResult,
+      teamAId: match.teamAId,
+      teamBId: match.teamBId,
+      teamAName: match.teamA?.name || 'Takım A',
+      teamBName: match.teamB?.name || 'Takım B',
+      isTeamMatch: match.createdFrom === 'TEAM_MATCH',
+      isSeriesMatch: !!match.seriesId,
+    };
+  }
+
+  // Sonuç bildir (takım kaptanı/admini) - W/L/D formatında
+  @UseGuards(JwtAuthGuard)
+  @Post(':id/report')
+  async submitMatchReport(
+    @Req() req: any,
+    @Param('id') matchId: string,
+    @Body() body: { result: 'TEAM_A' | 'TEAM_B' | 'DRAW'; notes?: string },
+  ) {
+    const userId = getUserIdFromReq(req);
+    if (!userId) throw new UnauthorizedException();
+
+    const match = await this.prisma.match.findUnique({
+      where: { id: matchId },
+      select: {
+        id: true,
+        teamAId: true,
+        teamBId: true,
+        createdFrom: true,
+        seriesId: true,
+        time: true,
+        status: true,
+      },
+    });
+    if (!match) throw new NotFoundException('match not found');
+    
+    // Sadece takım maçları ve seri maçları için sonuç bildirilebilir
+    const isTeamMatch = match.createdFrom === 'TEAM_MATCH';
+    const isSeriesMatch = !!match.seriesId;
+    
+    if (!isTeamMatch && !isSeriesMatch) {
+      throw new BadRequestException('only_team_or_series_matches');
+    }
+
+    // Maç saati geçmiş mi kontrol et
+    if (match.time && new Date(match.time).getTime() > Date.now()) {
+      throw new BadRequestException('match_not_started');
+    }
+
+    // Kullanıcı hangi takımda ve kaptan/admin mi?
+    let userTeamId: string | null = null;
+    let userRole: string | null = null;
+
+    for (const teamId of [match.teamAId, match.teamBId].filter(Boolean) as string[]) {
+      const membership = await this.prisma.teamMember.findFirst({
+        where: {
+          teamId,
+          userId,
+          status: 'ACTIVE',
+          role: { in: ['OWNER', 'ADMIN'] },
+        },
+        select: { role: true, teamId: true },
+      });
+      if (membership) {
+        userTeamId = teamId;
+        userRole = membership.role;
+        break;
+      }
+    }
+
+    if (!userTeamId || !userRole) {
+      throw new ForbiddenException('must_be_team_captain');
+    }
+
+    // Result -> Score dönüşümü
+    let scoreA: number;
+    let scoreB: number;
+    
+    switch (body.result) {
+      case 'TEAM_A':
+        scoreA = 1; scoreB = 0;
+        break;
+      case 'TEAM_B':
+        scoreA = 0; scoreB = 1;
+        break;
+      case 'DRAW':
+      default:
+        scoreA = 0; scoreB = 0;
+        break;
+    }
+
+    // Upsert: aynı takımdan tekrar rapor gelirse güncelle
+    const report = await this.prisma.matchReport.upsert({
+      where: {
+        matchId_teamId: { matchId, teamId: userTeamId },
+      },
+      create: {
+        matchId,
+        teamId: userTeamId,
+        reporterId: userId,
+        reporterRole: userRole,
+        scoreTeamA: scoreA,
+        scoreTeamB: scoreB,
+        notes: body.notes || null,
+      },
+      update: {
+        reporterId: userId,
+        reporterRole: userRole,
+        scoreTeamA: scoreA,
+        scoreTeamB: scoreB,
+        notes: body.notes || null,
+      },
+    });
+
+    // Her iki takım da rapor vermiş mi kontrol et
+    const allReports = await this.prisma.matchReport.findMany({
+      where: { matchId },
+    });
+
+    let consensus = false;
+    if (allReports.length >= 2) {
+      const r1 = allReports[0];
+      const r2 = allReports[1];
+      if (r1.scoreTeamA === r2.scoreTeamA && r1.scoreTeamB === r2.scoreTeamB) {
+        consensus = true;
+
+        // Maçı kapat
+        await this.prisma.match.update({
+          where: { id: matchId },
+          data: { status: 'CLOSED', closedAt: new Date() },
+        });
+
+        // ELO güncelleme sadece TAKIM MAÇLARINDA (seri maçlarında ELO yok)
+        if (isTeamMatch) {
+          try {
+            await this.triggerEloUpdate(matchId, r1.scoreTeamA, r1.scoreTeamB);
+          } catch (e) {
+            console.error('[MatchReport] ELO update failed:', e);
+          }
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      report,
+      consensus,
+      reportsCount: allReports.length,
+    };
+  }
+
+  // ELO güncelleme (internal helper) - Sadece takım maçlarında çağrılır
+  private async triggerEloUpdate(matchId: string, scoreA: number, scoreB: number) {
+    const match = await this.prisma.match.findUnique({
+      where: { id: matchId },
+      select: {
+        teamAId: true,
+        teamBId: true,
+        teamA: { select: { id: true, elo: true, members: { where: { status: 'ACTIVE' }, select: { userId: true } } } },
+        teamB: { select: { id: true, elo: true, members: { where: { status: 'ACTIVE' }, select: { userId: true } } } },
+      },
+    });
+
+    if (!match?.teamA || !match?.teamB) return;
+
+    const teamAElo = match.teamA.elo ?? 1000;
+    const teamBElo = match.teamB.elo ?? 1000;
+
+    // Sonuç: 1 = A kazandı, 0 = B kazandı, 0.5 = berabere
+    // scoreA=1,scoreB=0 -> A kazandı
+    // scoreA=0,scoreB=1 -> B kazandı
+    // scoreA=0,scoreB=0 -> Berabere
+    let resultA: number;
+    if (scoreA > scoreB) resultA = 1;
+    else if (scoreA < scoreB) resultA = 0;
+    else resultA = 0.5;
+
+    const resultB = 1 - resultA;
+
+    // Beklenen skorlar
+    const expectedA = 1 / (1 + Math.pow(10, (teamBElo - teamAElo) / 400));
+    const expectedB = 1 - expectedA;
+
+    // K faktörü
+    const K = 32;
+
+    // Yeni ELO'lar
+    const newEloA = Math.round(teamAElo + K * (resultA - expectedA));
+    const newEloB = Math.round(teamBElo + K * (resultB - expectedB));
+
+    // Takım ELO'larını güncelle
+    await this.prisma.team.update({
+      where: { id: match.teamA.id },
+      data: { elo: newEloA },
+    });
+    await this.prisma.team.update({
+      where: { id: match.teamB.id },
+      data: { elo: newEloB },
+    });
+
+    console.log(`[ELO] Match ${matchId}: TeamA ${teamAElo} -> ${newEloA}, TeamB ${teamBElo} -> ${newEloB}`);
   }
 }
 

@@ -632,4 +632,99 @@ export class UsersController {
       .map(({ _ok, ...rest }) => rest);
     return { items };
   }
+
+  /* ===================== SON 5 MAÇ W/L/D ===================== */
+  @UseGuards(AuthGuard('jwt'))
+  @Get(':id/match-history')
+  async getMatchHistory(
+    @Param('id') userId: string,
+    @Query('limit') limitQ?: string,
+  ) {
+    const limit = Math.min(10, Math.max(1, parseInt(limitQ || '5', 10)));
+
+    // Kullanıcının takımlarını bul
+    const memberships = await this.prisma.teamMember.findMany({
+      where: { userId, status: 'ACTIVE' },
+      select: { teamId: true },
+    });
+
+    const teamIds = memberships.map((m) => m.teamId);
+    if (teamIds.length === 0) {
+      return { matches: [] };
+    }
+
+    // Bu takımların maçlarını bul (sonucu onaylanmış olanlar)
+    const matches = await this.prisma.match.findMany({
+      where: {
+        OR: [
+          { teamAId: { in: teamIds } },
+          { teamBId: { in: teamIds } },
+        ],
+        status: 'CLOSED',
+      },
+      include: {
+        teamA: { select: { id: true, name: true } },
+        teamB: { select: { id: true, name: true } },
+        matchReports: {
+          take: 2,
+          orderBy: { createdAt: 'asc' },
+        },
+        series: { select: { id: true, title: true } },
+      },
+      orderBy: { time: 'desc' },
+      take: limit * 2, // Daha fazla al, sonra filtrele
+    });
+
+    // Sonucu onaylanmış olanları filtrele ve W/L/D hesapla
+    const results: Array<{
+      matchId: string;
+      time: string | null;
+      type: 'TEAM' | 'SERIES';
+      opponentName: string;
+      result: 'W' | 'L' | 'D';
+      teamAName: string;
+      teamBName: string;
+      seriesName?: string;
+    }> = [];
+
+    for (const match of matches) {
+      if (results.length >= limit) break;
+
+      // En az 2 rapor ve uyuşma kontrolü
+      if (!match.matchReports || match.matchReports.length < 2) continue;
+      const r1 = match.matchReports[0];
+      const r2 = match.matchReports[1];
+      if (r1.scoreTeamA !== r2.scoreTeamA || r1.scoreTeamB !== r2.scoreTeamB) continue;
+
+      // Kullanıcının takımını bul
+      const userTeamId = teamIds.find((t) => t === match.teamAId || t === match.teamBId);
+      if (!userTeamId) continue;
+
+      const isTeamA = userTeamId === match.teamAId;
+      const opponentTeam = isTeamA ? match.teamB : match.teamA;
+
+      // W/L/D hesapla
+      let result: 'W' | 'L' | 'D';
+      if (r1.scoreTeamA > r1.scoreTeamB) {
+        result = isTeamA ? 'W' : 'L';
+      } else if (r1.scoreTeamA < r1.scoreTeamB) {
+        result = isTeamA ? 'L' : 'W';
+      } else {
+        result = 'D';
+      }
+
+      results.push({
+        matchId: match.id,
+        time: match.time?.toISOString() || null,
+        type: match.seriesId ? 'SERIES' : 'TEAM',
+        opponentName: opponentTeam?.name || 'Rakip Takım',
+        result,
+        teamAName: match.teamA?.name || 'Takım A',
+        teamBName: match.teamB?.name || 'Takım B',
+        seriesName: match.series?.title,
+      });
+    }
+
+    return { matches: results };
+  }
 }

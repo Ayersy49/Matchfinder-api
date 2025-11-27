@@ -64,7 +64,7 @@ function sizeFromFormat(fmt?: string): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-// OWNER ya da ADMIN (kaptan) mı?
+// OWNER ya da ADMIN (kaptan/yardımcı kaptan) mı?
 async function isCaptainOrOwner(
   prisma: PrismaService,
   teamId: string,
@@ -74,6 +74,7 @@ async function isCaptainOrOwner(
     where: { teamId, userId, status: 'ACTIVE' },
     select: { role: true },
   });
+  console.log(`[isCaptainOrOwner] teamId=${teamId}, userId=${userId}, role=${m?.role || 'NOT_FOUND'}`);
   return !!m && (m.role === 'OWNER' || m.role === 'ADMIN');
 }
 
@@ -83,7 +84,7 @@ async function assertCaptainOrOwner(
   userId: string,
 ) {
   if (!(await isCaptainOrOwner(prisma, teamId, userId))) {
-    throw new ForbiddenException('only_captain');
+    throw new ForbiddenException('Bu işlem için Kaptan veya Yardımcı Kaptan olmalısın.');
   }
 }
 
@@ -680,10 +681,10 @@ export class TeamsController {
       if (!isNaN(d.getTime())) where.createdAt = { gt: d };
     }
 
-    const items =  await this.prisma.teamChatMessage.findMany({
+    const items = await this.prisma.teamChatMessage.findMany({
       where,
       orderBy: { createdAt: 'asc' },
-      include: { user: { select: { id: true /* nickname yoksa sorun değil */ } } },
+      include: { user: { select: { id: true, username: true, phone: true } } },
       take: 200,
     });
 
@@ -691,7 +692,11 @@ export class TeamsController {
       id: m.id,
       text: m.text,
       createdAt: m.createdAt,
-      user: { id: m.user.id, nickname: undefined },
+      user: {
+        id: m.user.id,
+        username: m.user.username || null,
+        phone: m.user.phone ? m.user.phone.slice(-3) : null,
+      },
     }));
   }
 
@@ -710,14 +715,18 @@ export class TeamsController {
 
     const m = await this.prisma.teamChatMessage.create({
       data: { teamId, userId: meId, text },
-      include: { user: { select: { id: true } } },
+      include: { user: { select: { id: true, username: true, phone: true } } },
     });
 
     return {
       id: m.id,
       text: m.text,
       createdAt: m.createdAt,
-      user: { id: m.user.id, nickname: undefined },
+      user: {
+        id: m.user.id,
+        username: m.user.username || null,
+        phone: m.user.phone ? m.user.phone.slice(-3) : null,
+      },
     };
   }
 
@@ -1050,16 +1059,43 @@ export class TeamsController {
     const toUserIds = Array.from(new Set(body?.toUserIds || [])).filter(Boolean);
     const toPhones = Array.from(new Set(body?.toPhones || [])).filter(Boolean);
 
+    // Username veya ID olabilir - username'leri ID'ye çevir
+    const resolvedUserIds: string[] = [];
+    const notFoundUsernames: string[] = [];
+    
+    for (const input of toUserIds) {
+      // CUID formatında mı kontrol et (cm ile başlar ve 25 karakter)
+      const isCuid = /^c[a-z0-9]{24,}$/i.test(input);
+      
+      if (isCuid) {
+        // Direkt ID olarak kullan
+        const exists = await this.prisma.user.findUnique({ where: { id: input }, select: { id: true } });
+        if (exists) {
+          resolvedUserIds.push(input);
+        } else {
+          notFoundUsernames.push(input);
+        }
+      } else {
+        // Username olarak ara
+        const user = await this.prisma.user.findUnique({ where: { username: input }, select: { id: true } });
+        if (user) {
+          resolvedUserIds.push(user.id);
+        } else {
+          notFoundUsernames.push(input);
+        }
+      }
+    }
+
     // aktif üyeler hariç
     const existing = await this.prisma.teamMember.findMany({
-      where: { teamId, userId: { in: toUserIds }, status: 'ACTIVE' },
+      where: { teamId, userId: { in: resolvedUserIds }, status: 'ACTIVE' },
       select: { userId: true },
     });
     const existingIds = new Set(
       existing.map((x: { userId: string }) => x.userId)
     );
 
-    const finalUserIds = toUserIds.filter((id) => !existingIds.has(id));
+    const finalUserIds = resolvedUserIds.filter((id) => !existingIds.has(id));
 
     // telefon -> kayıtlı kullanıcıya map
     let phoneTargets: Array<{ toUserId?: string; toPhone?: string }> = [];
@@ -1098,10 +1134,16 @@ export class TeamsController {
         message: body?.message || null,
       })),
     ];
-    if (!payload.length) return { created: 0 };
+    
+    if (!payload.length) {
+      if (notFoundUsernames.length) {
+        throw new BadRequestException(`Kullanıcı bulunamadı: ${notFoundUsernames.join(', ')}`);
+      }
+      return { created: 0 };
+    }
 
     await this.prisma.teamInvite.createMany({ data: payload });
-    return { created: payload.length };
+    return { created: payload.length, notFound: notFoundUsernames };
   }
 
   // Kaptanlar davet listesini görsün
@@ -1165,7 +1207,7 @@ export class TeamsController {
       return { ok: true, declined: true };
     }
 
-    // ACCEPT ⇒ üyeliğe ekle + varsa boş bench slotuna yerleştir
+    // ACCEPT ⇒ üyeliğe ekle (otomatik slot ataması yapılmaz, kullanıcı kendisi seçer)
     await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const exists = await tx.teamMember.findUnique({
         where: { teamId_userId: { teamId: inv.teamId, userId: uid } },
@@ -1176,25 +1218,8 @@ export class TeamsController {
         });
       }
 
-      const team = await tx.team.findUnique({
-        where: { id: inv.teamId },
-        select: { formationCode: true },
-      });
-
-      const bench = await tx.teamPositionSlot.findMany({
-        where: {
-          teamId: inv.teamId,
-          formationCode: team!.formationCode,
-          slotKey: { in: ['SB1', 'SB2', 'SB3'] },
-        },
-        orderBy: { slotKey: 'asc' },
-        select: { id: true, userId: true },
-      });
-      const free = bench.find((b: { id: string; userId: string | null }) => !b.userId);
-
-      if (free) {
-        await tx.teamPositionSlot.update({ where: { id: free.id }, data: { userId: uid } });
-      }
+      // NOT: Otomatik slot ataması kaldırıldı.
+      // Yeni üye takım sayfasına girdiğinde boş mevkilerden birini kendisi seçecek.
 
       await tx.teamInvite.update({
         where: { id },

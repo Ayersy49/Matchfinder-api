@@ -145,6 +145,11 @@ model User {
   // Maç raporları
   matchReports MatchReport[] // -> MatchReport.reporter
 
+  // -------- Halı Saha (Pitch) ilişkileri --------
+  pitchesCreated  Pitch[]       @relation("PitchCreator")
+  pitchVisits     PitchVisit[]
+  pitchReports    PitchReport[]
+
   @@index([lat, lng])
 }
 
@@ -230,6 +235,13 @@ model Match {
   highlightUntil DateTime?
   createdFrom    String? // 'TEAM_MATCH' vb.
 
+  // ---- HALI SAHA LOKASYONU (YENİ) ----
+  pitchId        String?
+  pitch          Pitch?   @relation("MatchPitch", fields: [pitchId], references: [id])
+  customLat      Float?   // Özel konum (pitch seçilmediyse)
+  customLng      Float?
+  customLabel    String?  // "Okul bahçesi" gibi
+
   // Seri ile ilişki (YENİ)
   seriesId String?
   series   MatchSeries? @relation(fields: [seriesId], references: [id])
@@ -266,6 +278,9 @@ model Match {
   disputeDeadline    DateTime? // 48 saat sonra (anlaşmazlık süresi)
   matchReports       MatchReport[] // Takımların raporları
 
+  // Pitch ziyaretleri (YENİ)
+  pitchVisits PitchVisit[]
+
   // ELO geçmişi back-relation (YENİ)
   teamEloHistory TeamEloHistory[]
 
@@ -275,6 +290,7 @@ model Match {
   @@index([teamAId])
   @@index([teamBId])
   @@index([seriesId])
+  @@index([pitchId])
 }
 
 model MatchInvite {
@@ -696,4 +712,93 @@ model MatchReport {
   @@unique([matchId, teamId]) // Her takım maç başına tek rapor
   @@index([matchId])
   @@index([teamId])
+}
+
+/**
+ * ---------------- Halı Saha (Pitch) Sistemi ----------------
+ */
+enum PitchSourceType {
+  GOOGLE_VERIFIED   // Google Places'tan doğrulanmış
+  OSM_CANDIDATE     // OpenStreetMap/Overpass'tan gelen aday
+  USER_SUGGESTED    // Kullanıcı önerisi
+}
+
+enum PitchStatus {
+  ACTIVE      // Aktif saha
+  CLOSED      // Kapanmış
+  RENOVATION  // Tadilatta
+  UNKNOWN     // Durumu belirsiz
+}
+
+model Pitch {
+  id                  String          @id @default(cuid())
+  name                String
+  city                String
+  district            String?
+  address             String?
+  lat                 Float
+  lng                 Float
+  
+  sourceType          PitchSourceType @default(OSM_CANDIDATE)
+  verificationLevel   Int             @default(0) // 0=aday, 1=önerildi, 2=topluluk onaylı, 3=işletme
+  status              PitchStatus     @default(ACTIVE)
+  
+  phone               String?
+  googlePlaceId       String?         @unique
+  osmId               String?         @unique
+  
+  createdByUserId     String?
+  createdBy           User?           @relation("PitchCreator", fields: [createdByUserId], references: [id])
+  
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+  
+  // Relations
+  matches             Match[]         @relation("MatchPitch")
+  visits              PitchVisit[]
+  reports             PitchReport[]
+  
+  @@index([city])
+  @@index([lat, lng])
+  @@index([verificationLevel])
+}
+
+model PitchVisit {
+  id        String   @id @default(cuid())
+  pitchId   String
+  userId    String
+  matchId   String?
+  createdAt DateTime @default(now())
+  
+  pitch     Pitch    @relation(fields: [pitchId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  match     Match?   @relation(fields: [matchId], references: [id], onDelete: SetNull)
+  
+  @@unique([pitchId, userId, matchId])
+  @@index([pitchId])
+  @@index([userId])
+}
+
+enum PitchReportType {
+  CLOSED          // Kapandı
+  RENOVATION      // Tadilatta
+  WRONG_LOCATION  // Konum yanlış
+  NOT_PITCH       // Halı saha değil
+  SAFETY_ISSUE    // Güvenlik sorunu
+}
+
+model PitchReport {
+  id         String          @id @default(cuid())
+  pitchId    String
+  reporterId String
+  type       PitchReportType
+  comment    String?
+  weight     Float           @default(1.0) // Raporun ağırlığı (güvenilir kullanıcı = yüksek)
+  createdAt  DateTime        @default(now())
+  
+  pitch      Pitch           @relation(fields: [pitchId], references: [id], onDelete: Cascade)
+  reporter   User            @relation(fields: [reporterId], references: [id], onDelete: Cascade)
+  
+  @@index([pitchId])
+  @@index([reporterId])
 }
